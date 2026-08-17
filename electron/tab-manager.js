@@ -3,7 +3,7 @@
  * Chrome-style tab architecture: each tab owns its own BrowserView with independent
  * page state, navigation history, rendering context, and lifecycle.
  */
-const { BrowserView } = require('electron');
+const { BrowserView, Menu, clipboard } = require('electron');
 
 class TabManager {
   constructor(mainWindow) {
@@ -92,6 +92,89 @@ class TabManager {
       const newTabId = this.createTab(details.url, isIncognito);
       this._sendToRenderer('new-tab-created', { tabId: newTabId, url: details.url, isIncognito });
       return { action: 'deny' }; // Prevent default Electron window, we manage tabs ourselves
+    });
+
+    // Native Context Menu (Right-click)
+    view.webContents.on('context-menu', (event, params) => {
+      const template = [];
+      
+      // Link context
+      if (params.linkURL) {
+        template.push({
+          label: 'Open link in new tab',
+          click: () => {
+            const newTabId = this.createTab(params.linkURL, isIncognito);
+            this._sendToRenderer('new-tab-created', { tabId: newTabId, url: params.linkURL, isIncognito });
+          }
+        });
+        template.push({
+          label: 'Copy link address',
+          click: () => { clipboard.writeText(params.linkURL); }
+        });
+        template.push({ type: 'separator' });
+      }
+
+      // Media context
+      if (params.hasImageContents && params.srcURL) {
+        template.push({
+          label: 'Save image as...',
+          click: () => { view.webContents.downloadURL(params.srcURL); }
+        });
+        template.push({
+          label: 'Copy image address',
+          click: () => { clipboard.writeText(params.srcURL); }
+        });
+        template.push({ type: 'separator' });
+      }
+
+      // Editable text context
+      if (params.isEditable) {
+        template.push({ role: 'undo' });
+        template.push({ role: 'redo' });
+        template.push({ type: 'separator' });
+        template.push({ role: 'cut' });
+        template.push({ role: 'copy' });
+        template.push({ role: 'paste' });
+        template.push({ role: 'selectAll' });
+      } else if (params.selectionText) {
+        // Just text selected
+        template.push({ role: 'copy' });
+        template.push({ type: 'separator' });
+        template.push({
+          label: 'Search Google for "' + (params.selectionText.length > 20 ? params.selectionText.substring(0, 20) + '...' : params.selectionText) + '"',
+          click: () => {
+            const url = `https://www.google.com/search?q=${encodeURIComponent(params.selectionText)}`;
+            const newTabId = this.createTab(url, isIncognito);
+            this._sendToRenderer('new-tab-created', { tabId: newTabId, url, isIncognito });
+          }
+        });
+      } else if (!params.linkURL && !params.hasImageContents) {
+        // General page context
+        template.push({
+          label: 'Back',
+          enabled: view.webContents.canGoBack(),
+          click: () => view.webContents.goBack()
+        });
+        template.push({
+          label: 'Forward',
+          enabled: view.webContents.canGoForward(),
+          click: () => view.webContents.goForward()
+        });
+        template.push({
+          label: 'Reload',
+          click: () => view.webContents.reload()
+        });
+        template.push({ type: 'separator' });
+        template.push({
+          label: 'Save page as...',
+          click: () => { view.webContents.downloadURL(view.webContents.getURL()); }
+        });
+      }
+
+      if (template.length > 0) {
+        const menu = Menu.buildFromTemplate(template);
+        menu.popup();
+      }
     });
 
     // Load the URL if it's not the internal new-tab page
@@ -401,9 +484,15 @@ class TabManager {
    */
   _sendTabState(tabId, view, url) {
     const nav = view.webContents.navigationHistory;
+    const currentUrl = url || view.webContents.getURL();
+    
+    // If the BrowserView hasn't fully loaded its initial URL yet, it returns an empty string.
+    // We must ignore empty strings to prevent overwriting React's optimistic 'chrome://newtab' state.
+    if (!currentUrl) return;
+
     this._sendToRenderer('tab-updated', { 
       tabId, 
-      url: url || view.webContents.getURL(), 
+      url: currentUrl, 
       title: view.webContents.getTitle(),
       canGoBack: nav ? nav.canGoBack() : view.webContents.canGoBack(),
       canGoForward: nav ? nav.canGoForward() : view.webContents.canGoForward()

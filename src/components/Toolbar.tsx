@@ -151,8 +151,8 @@ export const Toolbar: React.FC<ToolbarProps> = ({
       <div className="relative flex-1">
         <div className={`flex items-center h-9 px-3 rounded-full border transition-all ${
           isFocused 
-            ? 'bg-white dark:bg-zinc-950 border-orange-500 ring-2 ring-orange-500/20 shadow-md' 
-            : isIncognito ? 'bg-zinc-800 border-zinc-700 text-zinc-200' : 'bg-[#F2ECE1] border-[#E2DAD0] text-zinc-800 hover:bg-[#EFE8DC]'
+            ? 'bg-white border-orange-500 ring-2 ring-orange-500/20 shadow-md text-black' 
+            : isIncognito ? 'bg-zinc-800 border-zinc-700 text-zinc-200' : 'bg-white border-[#E2DAD0] text-black hover:bg-zinc-50'
         }`}>
           {/* SSL Lock / Chrome icon */}
           <button 
@@ -185,7 +185,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             }}
             onKeyDown={handleKeyDown}
             placeholder="Search with Google or enter address"
-            className="w-full bg-transparent text-xs outline-none font-medium truncate"
+            className="w-full bg-transparent text-xs outline-none font-medium truncate text-black placeholder-zinc-500"
           />
 
           {/* Bookmark Star */}

@@ -140,6 +140,18 @@ export default function App() {
       setActiveTabId(data.tabId);
       setBrowserMode('browser');
     });
+    (window as any).electronAPI.onDownloadProgress((data: any) => {
+      setDownloads(prev => {
+        const exists = prev.find(d => d.fileName === data.fileName);
+        if (exists) {
+          return prev.map(d => d.fileName === data.fileName ? { ...d, progress: data.percent, status: 'downloading' } : d);
+        }
+        return [{ id: `dl-${Date.now()}`, fileName: data.fileName, url: '', progress: data.percent, status: 'downloading', startTime: Date.now() }, ...prev];
+      });
+    });
+    (window as any).electronAPI.onDownloadComplete((data: any) => {
+      setDownloads(prev => prev.map(d => d.fileName === data.fileName ? { ...d, progress: 100, status: 'completed' } : d));
+    });
   }, [isElectron]);
 
   // Auto-open side panel when AI needs approval or CommandBar dispatches
@@ -245,11 +257,12 @@ export default function App() {
     api.onMenuCommandBar(() => setShowCommandBar(prev => !prev));
     
     const handleVoiceDown = () => {
-      setShowVoiceBar(true);
+      setShowVoiceBar(true); // Always ensure it's visible
+      window.dispatchEvent(new Event('voice-hold-start'));
     };
 
     const handleVoiceUp = () => {
-      window.dispatchEvent(new Event('stop-voice-recording'));
+      window.dispatchEvent(new Event('voice-hold-end'));
     };
 
     if (api.onVoiceShortcutDown) {
@@ -594,7 +607,7 @@ export default function App() {
 
       {showVoiceBar && (
         <div className="absolute top-0 left-1/2 -translate-x-1/2 z-[9999]">
-          <VoiceCommandBar />
+          <VoiceCommandBar onClose={() => setShowVoiceBar(false)} />
         </div>
       )}
 

@@ -17,7 +17,7 @@ class ModelGateway {
   constructor() {
     this.apiKey = process.env.GROQ_API_KEY;
     this.defaultModel = 'llama-3.1-8b-instant'; // fast default
-    this.reasoningModel = 'llama3-70b-8192'; // powerful model
+    this.reasoningModel = 'llama-3.1-70b-versatile'; // powerful model
     this.baseUrl = 'https://api.groq.com/openai/v1/chat/completions';
     this.modelsUrl = 'https://api.groq.com/openai/v1/models';
     

@@ -59,6 +59,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.removeAllListeners('voice-state-update');
     ipcRenderer.on('voice-state-update', (_, data) => cb(data));
   },
+  onDownloadProgress: (cb) => {
+    ipcRenderer.removeAllListeners('download-progress');
+    ipcRenderer.on('download-progress', (_, data) => cb(data));
+  },
+  onDownloadComplete: (cb) => {
+    ipcRenderer.removeAllListeners('download-complete');
+    ipcRenderer.on('download-complete', (_, data) => cb(data));
+  },
 
   // ─── Menu / Keyboard Shortcut IPC ────────────────────────────────────────
   onMenuNewTab:             (cb) => { ipcRenderer.removeAllListeners('menu:new-tab');              ipcRenderer.on('menu:new-tab', () => cb()); },

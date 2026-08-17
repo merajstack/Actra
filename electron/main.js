@@ -93,7 +93,7 @@ function createWindow() {
     if (task.status === 'planning') state = 'THINKING';
     
     // Broadcast to React UI so VoiceCommandBar can update
-    mainWindow.webContents.send('voice-state-update', { state, message: task.statusMessage || task.status });
+    mainWindow.webContents.send('voice-state-update', { state, message: task.outputs || task.statusMessage || task.status });
   });
 
   // Load renderer UI
@@ -158,6 +158,15 @@ app.whenReady().then(() => {
       if (blocked.includes(key.toLowerCase())) delete headers[key];
     }
     callback({ responseHeaders: headers });
+  });
+
+  // Automatically grant permissions for microphone so renderer doesn't get silent stream
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+    if (permission === 'media') {
+      callback(true);
+    } else {
+      callback(false);
+    }
   });
 
   app.on('activate', () => {
@@ -674,7 +683,7 @@ Execution History:
 ${globalExecutionHistory.map(h => h.action).join(' -> ')}
 
 If the user's request was an ACTION request (e.g., you navigated, clicked, or typed), you MUST ONLY output a concise success/failure status (e.g. "✓ Task completed. The MrBeast video is playing."). Do NOT output conversational instructions explaining how the user can do it themselves.
-If the user's request was INFORMATIONAL, provide a helpful, conversational answer based on this data.
+If the user's request was INFORMATIONAL (a general question), you MUST ALWAYS respond in 3 lines or less, summarizing the answer concisely with its core meaning.
 
 CRITICAL INSTRUCTION: If your response contains any URLs or links, you MUST output EACH link inside its own dedicated markdown code block, like this:
 \`\`\`text

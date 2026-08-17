@@ -134,13 +134,13 @@ export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({
   const [tasks, setTasks] = useState<AITask[]>([]);
   const [approvals, setApprovals] = useState<AIApprovalRequest[]>([]);
   const [isRecording, setIsRecording] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const audioDataRef = useRef<Float32Array>(new Float32Array(0));
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
   const baseTextRef = useRef<string>('');
   
   const api = (window as any).electronAPI;
@@ -213,22 +213,36 @@ export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({
   const toggleRecording = async () => {
     if (isRecording) {
       // Stop recording and transcribe
-      const audioBuffer = audioDataRef.current;
-      
-      if (processorRef.current) { processorRef.current.disconnect(); processorRef.current = null; }
-      if (audioContextRef.current) { audioContextRef.current.close(); audioContextRef.current = null; }
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+      }
       if (mediaStreamRef.current) { mediaStreamRef.current.getTracks().forEach(t => t.stop()); mediaStreamRef.current = null; }
       
       setIsRecording(false);
 
-      if (audioBuffer.length > 1600) {
+      // Wait a brief moment for the final ondataavailable event to fire
+      await new Promise(r => setTimeout(r, 100));
+
+      if (audioChunksRef.current.length > 0) {
         setInput(baseTextRef.current + 'Transcribing...');
         try {
-          const result = await api.transcribeAudio(audioBuffer.buffer);
-          if (result.success && result.text?.trim()) {
-            setInput(baseTextRef.current + result.text.trim());
+          const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+          const arrayBuffer = await blob.arrayBuffer();
+          
+          const audioCtx = new AudioContext({ sampleRate: 16000 });
+          const decodedData = await audioCtx.decodeAudioData(arrayBuffer);
+          const float32Audio = decodedData.getChannelData(0);
+          await audioCtx.close();
+
+          if (float32Audio.length > 1600) {
+            const result = await api.transcribeAudio(float32Audio.buffer);
+            if (result.success && result.text?.trim()) {
+              setInput(baseTextRef.current + result.text.trim());
+            } else {
+              setInput(baseTextRef.current); // Restore original text
+            }
           } else {
-            setInput(baseTextRef.current); // Restore original text
+            setInput(baseTextRef.current); // Too short
           }
         } catch (err) {
           console.error('Transcription error:', err);
@@ -243,29 +257,22 @@ export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({
     setIsRecording(true);
     baseTextRef.current = input;
     if (baseTextRef.current && !baseTextRef.current.endsWith(' ')) baseTextRef.current += ' ';
-    audioDataRef.current = new Float32Array(0);
+    audioChunksRef.current = [];
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
       
-      const audioContext = new AudioContext({ sampleRate: 16000 });
-      audioContextRef.current = audioContext;
-      
-      const source = audioContext.createMediaStreamSource(stream);
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
 
-      source.connect(processor);
-      processor.connect(audioContext.destination);
-
-      processor.onaudioprocess = (e) => {
-        const inputData = e.inputBuffer.getChannelData(0);
-        const newData = new Float32Array(audioDataRef.current.length + inputData.length);
-        newData.set(audioDataRef.current);
-        newData.set(inputData, audioDataRef.current.length);
-        audioDataRef.current = newData;
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          audioChunksRef.current.push(e.data);
+        }
       };
+
+      mediaRecorder.start(100);
     } catch (err) {
       console.error('Mic error:', err);
       setIsRecording(false);
@@ -340,11 +347,19 @@ export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({
                 
                 {/* Copy Button (Shows on Hover) */}
                 <button
-                  onClick={() => navigator.clipboard.writeText(msg.content)}
+                  onClick={() => {
+                    navigator.clipboard.writeText(msg.content);
+                    setCopiedId(msg.id);
+                    setTimeout(() => setCopiedId(null), 2000);
+                  }}
                   className={`absolute opacity-0 group-hover:opacity-100 transition-opacity p-1.5 rounded-md shadow-sm border bg-white text-zinc-500 hover:text-zinc-700 hover:bg-zinc-50 ${isUser ? '-left-10 top-0 border-zinc-200' : '-right-10 top-0 border-zinc-200'}`}
-                  title="Copy to clipboard"
+                  title={copiedId === msg.id ? "Copied!" : "Copy to clipboard"}
                 >
-                  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                  {copiedId === msg.id ? (
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-emerald-500"><polyline points="20 6 9 17 4 12"/></svg>
+                  ) : (
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                  )}
                 </button>
               </div>
             </div>
