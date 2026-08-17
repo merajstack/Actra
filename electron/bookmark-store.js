@@ -1,7 +1,7 @@
 /**
  * Actra Browser - Bookmark Store using electron-store
  */
-const Store = require('electron-store');
+const { default: Store } = require('electron-store');
 const store = new Store();
 
 class BookmarkStore {

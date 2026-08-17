@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import { Globe, Lock, Shield, Sparkles, FileText, Code, CheckCircle, RefreshCw, ExternalLink, Search, Image, Video, Newspaper } from 'lucide-react';
-import { YouTubeEngine } from './YouTubeEngine';
-import { GitHubEngine } from './GitHubEngine';
+
 
 interface BrowserContentProps {
   url: string;
@@ -21,9 +20,7 @@ export const BrowserContent: React.FC<BrowserContentProps> = ({ url, zoomLevel, 
   };
 
   const lowerUrl = url.toLowerCase();
-  const isYouTube = lowerUrl.includes('youtube.com') || lowerUrl.includes('youtu.be');
-  const isGitHub = lowerUrl.includes('github.com');
-  const isSearchUrl = !isYouTube && !isGitHub && (url.includes('google.com/search') || url.includes('duckduckgo.com') || url.includes('search?q=') || !url.includes('.') || url.includes(' '));
+  const isSearchUrl = (url.includes('google.com/search') || url.includes('duckduckgo.com') || url.includes('search?q=') || !url.includes('.') || url.includes(' '));
   let searchQuery = '';
   try {
     const urlObj = new URL(url.startsWith('http') ? url : `https://${url}`);
@@ -64,38 +61,6 @@ export const BrowserContent: React.FC<BrowserContentProps> = ({ url, zoomLevel, 
       className={`flex-1 relative flex flex-col overflow-hidden ${isIncognito ? 'bg-zinc-950 text-zinc-100' : 'bg-[#FDFBF7] text-zinc-800'}`}
       style={{ zoom: `${zoomLevel}%` }}
     >
-      {/* Top Bar for Page controls (Reader mode / Source view) */}
-      <div className="h-9 bg-[#F5F0E6] dark:bg-zinc-900 border-b border-[#E8E2D5] dark:border-zinc-800 px-4 flex items-center justify-between text-xs select-none">
-        <div className="flex items-center space-x-2 text-zinc-600 dark:text-zinc-300 truncate">
-          <button onClick={handleRefresh} className="p-1 hover:bg-zinc-200 dark:hover:bg-zinc-800 rounded transition-colors cursor-pointer" title="Refresh">
-            <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin text-orange-500' : ''}`} />
-          </button>
-          <Lock className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-          <span className="truncate font-mono text-[11px] font-medium">{url}</span>
-          <span className="text-[10px] bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded font-semibold">Actra Engine</span>
-        </div>
-
-        <div className="flex items-center space-x-2">
-          <button
-            onClick={() => setViewMode(viewMode === 'reader' ? 'normal' : 'reader')}
-            className={`flex items-center space-x-1 px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
-              viewMode === 'reader' ? 'bg-orange-600 text-white shadow-xs' : 'bg-[#EAE4D6] dark:bg-zinc-800 hover:bg-[#E2DBD0] text-zinc-700 dark:text-zinc-300'
-            }`}
-          >
-            <FileText className="w-3 h-3" />
-            <span>Reader Mode</span>
-          </button>
-          <button
-            onClick={() => setViewMode(viewMode === 'source' ? 'normal' : 'source')}
-            className={`flex items-center space-x-1 px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
-              viewMode === 'source' ? 'bg-orange-600 text-white shadow-xs' : 'bg-[#EAE4D6] dark:bg-zinc-800 hover:bg-[#E2DBD0] text-zinc-700 dark:text-zinc-300'
-            }`}
-          >
-            <Code className="w-3 h-3" />
-            <span>Page Source</span>
-          </button>
-        </div>
-      </div>
 
       {/* Content Area */}
       <div className="flex-1 overflow-y-auto relative flex flex-col bg-white dark:bg-zinc-950">
@@ -122,10 +87,6 @@ export const BrowserContent: React.FC<BrowserContentProps> = ({ url, zoomLevel, 
             </span>
             <h1 className="text-3xl font-bold text-zinc-900 dark:text-zinc-100">Clean Article Presentation for {url}</h1>
           </div>
-        ) : isYouTube ? (
-          <YouTubeEngine />
-        ) : isGitHub ? (
-          <GitHubEngine />
         ) : isSearchUrl ? (
           <div className="flex-1 bg-white dark:bg-zinc-950 min-h-full">
             {/* Search Header */}
@@ -218,7 +179,7 @@ export const BrowserContent: React.FC<BrowserContentProps> = ({ url, zoomLevel, 
         ) : (
           <iframe
             src={url}
-            className="w-full h-full border-none bg-white"
+            className="flex-1 w-full h-full border-none bg-white block"
             title={url}
             sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
           />

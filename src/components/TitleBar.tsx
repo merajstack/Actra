@@ -8,41 +8,19 @@ interface TitleBarProps {
 
 export const TitleBar: React.FC<TitleBarProps> = ({ isIncognito, windowTitle }) => {
   return (
-    <div className={`h-9 px-3 flex items-center justify-between select-none ${
-      isIncognito ? 'bg-zinc-900 text-zinc-200 border-b border-zinc-800' : 'bg-[#F5F0E6] text-zinc-700 border-b border-[#E8E2D5]'
-    }`}>
-      {/* macOS Traffic Lights */}
-      <div className="flex items-center space-x-2 w-28">
-        <button 
-          className="w-3 h-3 rounded-full bg-[#FF5F56] border border-[#E0443E] hover:opacity-90 flex items-center justify-center group cursor-pointer transition-all"
-          title="Close Window"
-          onClick={() => alert('Actra window close simulated')}
-        >
-          <span className="text-[8px] text-zinc-800 opacity-0 group-hover:opacity-100 font-bold">×</span>
-        </button>
-        <button 
-          className="w-3 h-3 rounded-full bg-[#FFBD2E] border border-[#DEA123] hover:opacity-90 flex items-center justify-center group cursor-pointer transition-all"
-          title="Minimize"
-          onClick={() => alert('Actra window minimize simulated')}
-        >
-          <span className="text-[8px] text-zinc-800 opacity-0 group-hover:opacity-100 font-bold">-</span>
-        </button>
-        <button 
-          className="w-3 h-3 rounded-full bg-[#27C93F] border border-[#1AAB29] hover:opacity-90 flex items-center justify-center group cursor-pointer transition-all"
-          title="Zoom / Fullscreen"
-          onClick={() => alert('Actra window maximize simulated')}
-        >
-          <span className="text-[8px] text-zinc-800 opacity-0 group-hover:opacity-100 font-bold">+</span>
-        </button>
-      </div>
+    <div className={`h-[38px] flex items-center justify-between px-4 select-none ${
+      isIncognito ? 'bg-black text-orange-500 border-b border-orange-900' : 'bg-[#F5F0E6] text-zinc-700 border-b border-[#E8E2D5]'
+    }`} style={{ WebkitAppRegion: 'drag' } as any}>
+      {/* Left side spacer to balance center title (since traffic lights were removed) */}
+      <div className="w-28"></div>
 
       {/* Center Title / Incognito badge */}
       <div className="flex items-center space-x-2 text-xs font-medium truncate max-w-md">
         {isIncognito && (
-          <span className="flex items-center space-x-1 px-1.5 py-0.5 rounded bg-zinc-800 text-orange-400 text-[10px] font-semibold border border-zinc-700">
-            <Shield className="w-3 h-3" />
-            <span>Incognito</span>
-          </span>
+          <div className="flex items-center space-x-1.5 px-2 py-0.5 rounded-md bg-orange-900/50 text-orange-400 border border-orange-800">
+            <Shield className="w-3.5 h-3.5" />
+            <span>Get a good life bro</span>
+          </div>
         )}
         <span className="truncate">{windowTitle || 'Actra Browser'}</span>
       </div>
