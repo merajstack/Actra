@@ -309,7 +309,8 @@ async function executeAICommand(command, activeTabId) {
       const understandStep = taskManager.addStep(task.id, '🔍 Understanding your request…', 'running', 'understand');
 
       let understanding = null;
-      const history = chatManager.getHistory();
+      let history = chatManager.getHistory();
+      if (history.length > 10) history = history.slice(-10); // cap to prevent 413
       try {
         if (!modelGateway.isAvailable()) {
           throw new Error('AI Model not available. Please set GROQ_API_KEY in your .env file.');
@@ -747,9 +748,39 @@ ipcMain.handle('ai:get-logs', (_, limit = 50) => auditLog.getLogs(limit));
 
 ipcMain.handle('auth:google-status',  () => googleAuth.isAuthenticated());
 
+ipcMain.handle('app:clear-data', async () => {
+  const { default: Store } = require('electron-store');
+  ['config', 'google-auth-tokens', 'bookmarks', 'history', 'memory'].forEach(name => {
+    try { new Store({ name }).clear(); } catch(e){}
+  });
+  try { new Store().clear(); } catch(e){}
+  await googleAuth.signOut();
+  return { success: true };
+});
+
+ipcMain.handle('app:save-keys', async (e, keys) => {
+  const { default: Store } = require('electron-store');
+  const store = new Store({ name: 'config' });
+  if (keys.primaryKey) store.set('groqKey', keys.primaryKey);
+  if (keys.secondaryKey) store.set('groqKeySecondary', keys.secondaryKey);
+  return { success: true };
+});
+
 ipcMain.handle('auth:google-signin',  async () => {
   try { await googleAuth.signIn(); return { success: true }; }
   catch (err) { return { success: false, error: err.message }; }
+});
+
+ipcMain.handle('auth:google-profile', async () => {
+  try {
+    const { google } = require('googleapis');
+    const client = googleAuth.getClient();
+    const oauth2 = google.oauth2({ version: 'v2', auth: client });
+    const { data } = await oauth2.userinfo.get();
+    return { success: true, profile: { name: data.name, picture: data.picture, email: data.email } };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
 });
 
 ipcMain.handle('auth:google-signout', async () => {

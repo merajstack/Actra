@@ -14,6 +14,8 @@ class GoogleAuth {
     this.store = new Store({ name: 'google-auth-tokens' });
     this.oauth2Client = null;
     this.scopes = [
+      'https://www.googleapis.com/auth/userinfo.profile',
+      'https://www.googleapis.com/auth/userinfo.email',
       'https://www.googleapis.com/auth/gmail.send',
       'https://www.googleapis.com/auth/gmail.readonly',
       'https://www.googleapis.com/auth/spreadsheets',

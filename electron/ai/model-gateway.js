@@ -15,9 +15,10 @@ require('dotenv').config({ path: path.join(__dirname, '../../.env') });
 
 class ModelGateway {
   constructor() {
-    this.apiKey = process.env.GROQ_API_KEY;
+    const { default: Store } = require('electron-store');
+    this.store = new Store({ name: 'config' });
     this.defaultModel = 'llama-3.1-8b-instant'; // fast default
-    this.reasoningModel = 'llama-3.1-70b-versatile'; // powerful model
+    this.reasoningModel = 'llama-3.1-8b-instant'; // Use 8B for everything to prevent 413
     this.baseUrl = 'https://api.groq.com/openai/v1/chat/completions';
     this.modelsUrl = 'https://api.groq.com/openai/v1/models';
     
@@ -26,32 +27,37 @@ class ModelGateway {
 
     this.availableModels = null;
     this.fetchingModels = null;
+  }
 
-    if (!this.apiKey || this.apiKey === 'YOUR_GROQ_API_KEY') {
-      console.warn('[ModelGateway] No GROQ_API_KEY found. AI features will fail.');
-    }
+  getApiKey() {
+    return this.store.get('groqKey') || process.env.GROQ_API_KEY;
   }
 
   isAvailable() {
-    return !!this.apiKey && this.apiKey !== 'YOUR_GROQ_API_KEY';
+    const key = this.getApiKey();
+    return !!key && key !== 'YOUR_GROQ_API_KEY';
   }
 
   async _fetchGroq(payload) {
-    if (!this.isAvailable()) {
-      throw new Error('Groq API Key is not configured. Please set GROQ_API_KEY in .env');
+    const key = this.getApiKey();
+    if (!key || key === 'YOUR_GROQ_API_KEY') {
+      throw new Error('Groq API Key is not configured. Please set GROQ_API_KEY in .env or via onboarding.');
     }
     
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 15000);
 
+    const payloadStr = JSON.stringify(payload);
+    console.log(`[ModelGateway] Sending payload. Size: ${payloadStr.length} chars. Model: ${payload.model}`);
+
     try {
       const response = await fetch(this.baseUrl, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
+          'Authorization': `Bearer ${key}`,
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify(payload),
+        body: payloadStr,
         signal: controller.signal
       });
 
@@ -84,8 +90,9 @@ class ModelGateway {
     
     this.fetchingModels = (async () => {
       try {
+        const key = this.getApiKey();
         const response = await fetch(this.modelsUrl, {
-          headers: { 'Authorization': `Bearer ${this.apiKey}` }
+          headers: { 'Authorization': `Bearer ${key}` }
         });
         if (response.ok) {
           const data = await response.json();
@@ -115,7 +122,7 @@ class ModelGateway {
 
     // For reasoning tasks, try to find a large model
     if (isReasoning) {
-       const large = textModels.find(m => m.includes('70b') || m.includes('120b') || m.includes('90b') || m.includes('27b') || m.includes('compound'));
+       const large = textModels.find(m => m.includes('8b') || m.includes('mini'));
        if (large) return large;
     } else {
        // For standard chat tasks, try to find a fast model

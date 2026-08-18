@@ -130,6 +130,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getGoogleAuthStatus: () => ipcRenderer.invoke('auth:google-status'),
   signInWithGoogle:    () => ipcRenderer.invoke('auth:google-signin'),
   signOutFromGoogle:   () => ipcRenderer.invoke('auth:google-signout'),
+  getGoogleProfile:    () => ipcRenderer.invoke('auth:google-profile'),
+  clearData:           () => ipcRenderer.invoke('app:clear-data'),
+  saveKeys:            (keys) => ipcRenderer.invoke('app:save-keys', keys),
 
   // ─── Voice UI ─────────────────────────────────────────────────────────────
 

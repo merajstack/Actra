@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Search, Sparkles, Plus, X, Globe, MoreVertical, Edit2, Trash2 } from 'lucide-react';
+import { Search, Sparkles, Plus, X, Globe, MoreVertical, Edit2, Trash2, LogOut } from 'lucide-react';
 
 interface Shortcut {
   id: string;
@@ -18,9 +18,11 @@ const DEFAULT_SHORTCUTS: Shortcut[] = [
 interface NewTabPageProps {
   onNavigate: (url: string) => void;
   isIncognito?: boolean;
+  userProfile?: { displayName: string; avatarUrl?: string } | null;
+  onLogout?: () => void;
 }
 
-export const NewTabPage: React.FC<NewTabPageProps> = ({ onNavigate, isIncognito }) => {
+export const NewTabPage: React.FC<NewTabPageProps> = ({ onNavigate, isIncognito, userProfile, onLogout }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [shortcuts, setShortcuts] = useState<Shortcut[]>(() => {
     const saved = localStorage.getItem('actra_shortcuts');
@@ -134,6 +136,31 @@ export const NewTabPage: React.FC<NewTabPageProps> = ({ onNavigate, isIncognito 
 
   return (
     <div className="flex-1 bg-[#FDFBF7] flex flex-col items-center justify-center p-8 select-none overflow-y-auto relative">
+      {/* Profile Badge */}
+      {userProfile && (
+        <div className="absolute top-6 right-8 flex items-center gap-2 animate-in fade-in z-50">
+          <div className="flex items-center gap-3 bg-white px-4 py-2 rounded-full border border-zinc-200 shadow-sm">
+            {userProfile.avatarUrl ? (
+              <img src={userProfile.avatarUrl} alt="Profile" className="w-7 h-7 rounded-full shadow-sm" />
+            ) : (
+              <div className="w-7 h-7 rounded-full bg-orange-100 flex items-center justify-center text-orange-600 font-medium text-xs">
+                {userProfile.displayName?.charAt(0).toUpperCase()}
+              </div>
+            )}
+            <span className="text-sm font-medium text-zinc-700">{userProfile.displayName}</span>
+          </div>
+          {onLogout && (
+            <button 
+              onClick={onLogout}
+              className="p-2.5 rounded-full bg-white hover:bg-red-50 text-zinc-400 hover:text-red-500 border border-zinc-200 shadow-sm transition-colors cursor-pointer"
+              title="Sign Out & Clear Data"
+            >
+              <LogOut className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+      )}
+
       <div className="w-full max-w-2xl flex flex-col items-center space-y-8 my-auto">
         {/* Logo & Title */}
         <div className="flex flex-col items-center space-y-4">

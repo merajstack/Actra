@@ -127,12 +127,16 @@ const TaskProgress: React.FC<{ taskId: string, tasks: AITask[] }> = ({ taskId, t
   );
 };
 
-export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({ onClose, activeTabId }) => {
+export const AIChat: React.FC<{ 
+  onClose: () => void; 
+  activeTabId: string; 
+  approvals: AIApprovalRequest[];
+  setApprovals: React.Dispatch<React.SetStateAction<AIApprovalRequest[]>>;
+}> = ({ onClose, activeTabId, approvals, setApprovals }) => {
   const [isExpanded, setIsExpanded] = useState(false);
   const [session, setSession] = useState<ChatSession | null>(null);
   const [input, setInput] = useState('');
   const [tasks, setTasks] = useState<AITask[]>([]);
-  const [approvals, setApprovals] = useState<AIApprovalRequest[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
@@ -171,14 +175,6 @@ export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({
           inputRef.current?.focus();
         }
       }, 100);
-    });
-
-    api.onAIRequireApproval((approval: AIApprovalRequest) => {
-      setApprovals(prev => {
-        const exists = prev.some(a => a.id === approval.id);
-        return exists ? prev : [approval, ...prev];
-      });
-      setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
     });
   }, []);
 

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Tab, Bookmark, HistoryItem, DownloadItem, BrowserMode } from './types';
+import { Tab, Bookmark, HistoryItem, DownloadItem, BrowserMode, AIApprovalRequest } from './types';
 import { INITIAL_BOOKMARKS, INITIAL_FOLDERS, INITIAL_HISTORY, INITIAL_DOWNLOADS } from './data/mockData';
 import { TabStrip } from './components/TabStrip';
 import { Toolbar } from './components/Toolbar';
@@ -17,6 +17,8 @@ import { BrowserContent } from './components/BrowserContent';
 // AI Components
 import { AIChat } from './components/ai/AIChat';
 import { VoiceCommandBar } from './components/VoiceCommandBar';
+
+import { OnboardingPage } from './components/OnboardingPage';
 
 // Virtual Cursor
 const VirtualCursor = ({ visible, url }: { visible: boolean, url: string }) => {
@@ -61,6 +63,17 @@ export default function App() {
   ]);
   const [activeTabId, setActiveTabId] = useState('tab-1');
   const [browserMode, setBrowserMode] = useState<BrowserMode>('browser');
+
+  const [isOnboardingComplete, setIsOnboardingComplete] = useState(
+    () => localStorage.getItem('onboardingComplete') === 'true'
+  );
+  
+  const [userProfile, setUserProfile] = useState<{ displayName: string; avatarUrl?: string }>(
+    () => {
+      const stored = localStorage.getItem('userProfile');
+      return stored ? JSON.parse(stored) : null;
+    }
+  );
   
   const [bookmarks, setBookmarks] = useState<Bookmark[]>(INITIAL_BOOKMARKS);
   const [folders, setFolders] = useState(INITIAL_FOLDERS);
@@ -76,6 +89,7 @@ export default function App() {
   const [showVoiceBar, setShowVoiceBar] = useState(false);
   const [showAIPanel, setShowAIPanel] = useState(false);
   const [virtualCursorURL, setVirtualCursorURL] = useState<string | null>(null);
+  const [approvals, setApprovals] = useState<AIApprovalRequest[]>([]);
 
   const activeTab = tabs.find(t => t.id === activeTabId) || tabs[0];
 
@@ -158,6 +172,14 @@ export default function App() {
   useEffect(() => {
     if (isElectron) {
       (window as any).electronAPI.onAIOpenSidePanel(() => {
+        const currentTab = tabs.find(t => t.id === activeTabId);
+        if (!currentTab?.isIncognito) setShowAIPanel(true);
+      });
+      (window as any).electronAPI.onAIRequireApproval((approval: AIApprovalRequest) => {
+        setApprovals(prev => {
+          const exists = prev.some(a => a.id === approval.id);
+          return exists ? prev : [approval, ...prev];
+        });
         const currentTab = tabs.find(t => t.id === activeTabId);
         if (!currentTab?.isIncognito) setShowAIPanel(true);
       });
@@ -568,7 +590,19 @@ export default function App() {
         ) : browserMode === 'help' || activeTab.url === 'chrome://help' ? (
           <HelpPage onBackToBrowser={() => setBrowserMode('browser')} />
         ) : activeTab.url === 'chrome://newtab' ? (
-          <NewTabPage onNavigate={handleNavigate} isIncognito={activeTab.isIncognito || false} />
+          <NewTabPage 
+            onNavigate={handleNavigate} 
+            isIncognito={activeTab.isIncognito || false} 
+            userProfile={userProfile}
+            onLogout={async () => {
+              setIsOnboardingComplete(false);
+              setUserProfile(null);
+              localStorage.clear();
+              if (isElectron) {
+                await (window as any).electronAPI.clearData();
+              }
+            }}
+          />
         ) : isElectron ? (
           // In Electron mode, the native BrowserView renders on top — show nothing here.
           // This prevents the React iframe fallback from interfering with the native renderer.
@@ -594,7 +628,12 @@ export default function App() {
       {/* AI Chat Panel (Floating) */}
       {showAIPanel && !activeTab.isIncognito && (
         <div className="absolute right-4 top-4 bottom-4 z-50">
-          <AIChat activeTabId={activeTabId} onClose={() => setShowAIPanel(false)} />
+          <AIChat 
+            activeTabId={activeTabId} 
+            onClose={() => setShowAIPanel(false)} 
+            approvals={approvals}
+            setApprovals={setApprovals}
+          />
         </div>
       )}
       
@@ -613,6 +652,48 @@ export default function App() {
 
       {/* Virtual Cursor for AI UI Interaction */}
       <VirtualCursor visible={!!virtualCursorURL} url={virtualCursorURL || ''} />
+
+      {!isOnboardingComplete && (
+        <OnboardingPage
+          onGoogleSignIn={async () => {
+            if (isElectron) {
+              const res = await (window as any).electronAPI.signInWithGoogle();
+              if (res.success) {
+                const profileRes = await (window as any).electronAPI.getGoogleProfile();
+                if (profileRes.success) {
+                  setUserProfile(prev => ({
+                    ...prev,
+                    avatarUrl: profileRes.profile.picture,
+                    displayName: profileRes.profile.name || prev?.displayName || ''
+                  }));
+                }
+              } else {
+                throw new Error(res.error);
+              }
+            }
+          }}
+          onComplete={(data) => {
+            localStorage.setItem('groqKey', data.primaryKey);
+            if (data.secondaryKey) localStorage.setItem('groqKeySecondary', data.secondaryKey);
+            
+            if (isElectron) {
+              (window as any).electronAPI.saveKeys({ primaryKey: data.primaryKey, secondaryKey: data.secondaryKey });
+            }
+            
+            setUserProfile(prev => {
+              const finalProfile = {
+                displayName: prev?.avatarUrl ? prev.displayName : data.displayName,
+                avatarUrl: prev?.avatarUrl
+              };
+              localStorage.setItem('userProfile', JSON.stringify(finalProfile));
+              return finalProfile;
+            });
+            
+            localStorage.setItem('onboardingComplete', 'true');
+            setIsOnboardingComplete(true);
+          }}
+        />
+      )}
     </div>
   );
 }
