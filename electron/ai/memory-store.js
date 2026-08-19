@@ -3,30 +3,31 @@
  * 
  * Persistent memory for companions using electron-store.
  */
-const { default: Store } = require('electron-store');
+const supabase = require('../supabase');
 
 class MemoryStore {
-  constructor() {
-    this.store = new Store({ name: 'ai-memory' });
+  async saveMemory(companionId, key, value) {
+    const { error } = await supabase.from('companion_memory').upsert({ companion_id: companionId, key, value });
+    if (error) console.error('Error saving memory:', error);
   }
 
-  saveMemory(companionId, key, value) {
-    const memoryPath = `companions.${companionId}.memory.${key}`;
-    this.store.set(memoryPath, value);
+  async getMemory(companionId, key) {
+    const { data } = await supabase.from('companion_memory').select('value').eq('companion_id', companionId).eq('key', key).single();
+    return data?.value || null;
   }
 
-  getMemory(companionId, key) {
-    const memoryPath = `companions.${companionId}.memory.${key}`;
-    return this.store.get(memoryPath, null);
+  async getAllMemories(companionId) {
+    const { data } = await supabase.from('companion_memory').select('key, value').eq('companion_id', companionId);
+    if (!data) return {};
+    return data.reduce((acc, curr) => {
+      acc[curr.key] = curr.value;
+      return acc;
+    }, {});
   }
 
-  getAllMemories(companionId) {
-    return this.store.get(`companions.${companionId}.memory`, {});
-  }
-
-  deleteMemory(companionId, key) {
-    const memoryPath = `companions.${companionId}.memory.${key}`;
-    this.store.delete(memoryPath);
+  async deleteMemory(companionId, key) {
+    const { error } = await supabase.from('companion_memory').delete().eq('companion_id', companionId).eq('key', key);
+    if (error) console.error('Error deleting memory:', error);
   }
 }
 

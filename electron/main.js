@@ -2,7 +2,7 @@
  * Actra Browser - Electron Main Process
  * Manages windows, BrowserView / WebContentsView tabs, IPC handlers, downloads, and app lifecycle.
  */
-const { app, BrowserWindow, BrowserView, ipcMain, session, Menu, dialog } = require('electron');
+const { app, BrowserWindow, BrowserView, ipcMain, session, Menu, dialog, clipboard } = require('electron');
 const path = require('path');
 const { default: Store } = require('electron-store');
 const store = new Store();
@@ -17,7 +17,7 @@ const createAppMenu = require('./menu');
 const ModelGateway    = require('./ai/model-gateway');
 const PageContextEngine = require('./ai/page-context');
 const BrowserActionsEngine = require('./ai/browser-actions');
-const BrowserInteractionEngine = require('./ai/browser-interaction');
+const { BrowserInteractionEngine } = require('./ai/browser-interaction');
 const TaskManager     = require('./ai/task-manager');
 const PlannerEngine   = require('./ai/planner');
 const ApprovalEngine  = require('./ai/approval-engine');
@@ -272,10 +272,20 @@ ipcMain.handle('voice:transcribe', async (_, audioBuffer) => {
   }
 });
 
-ipcMain.handle('ai:clear-chat', () => { chatManager.clearActiveSession(); return chatManager.getHistory(); });
+ipcMain.handle('ai:clear-chat', async () => {
+  if (taskManager?.cancelAllActiveTasks) taskManager.cancelAllActiveTasks();
+  if (approvalEngine?.rejectAll) approvalEngine.rejectAll('Cleared by user');
+  await chatManager.clearActiveSession();
+  return await chatManager.getHistory();
+});
 ipcMain.handle('ai:cancel-task', (_, taskId) => {
   taskManager.updateTaskStatus(taskId, 'cancelled');
   return true;
+});
+ipcMain.handle('ai:cancel-all-tasks', () => {
+  const result = taskManager.cancelAllActiveTasks ? taskManager.cancelAllActiveTasks() : { success: true, cancelled: [] };
+  if (approvalEngine?.rejectAll) approvalEngine.rejectAll('Cancelled by user');
+  return result;
 });
 
 /**
@@ -288,13 +298,13 @@ ipcMain.handle('ai:cancel-task', (_, taskId) => {
  */
 async function executeAICommand(command, activeTabId) {
   // 1. Add User Message
-  chatManager.addMessage('user', command);
+  await chatManager.addMessage('user', command);
 
   // 1. USER_REQUEST — create task + audit entry
   const task = taskManager.createTask(command, 'default');
   
   // Add Assistant Message to track progress (linked to taskId)
-  const assistantMsg = chatManager.addMessage('assistant', '', { taskId: task.id });
+  const assistantMsg = await chatManager.addMessage('assistant', '', { taskId: task.id });
   
   const auditEntryId = auditLog.createEntry(task.id, command);
   const actionsProposed = [];
@@ -309,7 +319,7 @@ async function executeAICommand(command, activeTabId) {
       const understandStep = taskManager.addStep(task.id, '🔍 Understanding your request…', 'running', 'understand');
 
       let understanding = null;
-      let history = chatManager.getHistory();
+      let history = await chatManager.getHistory();
       if (history.length > 10) history = history.slice(-10); // cap to prevent 413
       try {
         if (!modelGateway.isAvailable()) {
@@ -702,13 +712,16 @@ https://example.com
         : `✅ ${finalPlanInterpretation}`;
 
       auditLog.updateEntry(auditEntryId, { execution_status: 'success', execution_result: summary });
-      taskManager.updateTaskStatus(task.id, 'completed', { outputs: finalResponseText });
-      chatManager.updateMessage(assistantMsg.id, { content: finalResponseText });
+      const responseText = finalResponseText || 'Task completed, but Actra returned an empty response.';
+      taskManager.updateTaskStatus(task.id, 'completed', { outputs: responseText });
+      if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: responseText });
 
     } catch (err) {
       console.error('[AI] Workflow failed:', err.message);
       taskManager.updateTaskStatus(task.id, 'failed', { error: err.message });
-      chatManager.updateMessage(assistantMsg.id, { content: `Error: ${err.message}` });
+      if (assistantMsg?.id) {
+        await chatManager.updateMessage(assistantMsg.id, { content: `Error: ${err.message}` });
+      }
       auditLog.updateEntry(auditEntryId, {
         execution_status: 'failed',
         error: err.message,
@@ -737,9 +750,16 @@ ipcMain.handle('ai:edit-approval', (_, approvalId, newArgs) => {
   return approvalEngine.editAndApprove(approvalId, newArgs);
 });
 
-// Task data
-ipcMain.handle('ai:get-companions', () => companionManager.getAllCompanions());
-ipcMain.handle('ai:get-tasks',      () => taskManager.getAllTasks());
+// Task data & approvals
+ipcMain.handle('ai:get-companions',   () => companionManager.getAllCompanions());
+ipcMain.handle('ai:get-tasks',        () => taskManager.getAllTasks());
+ipcMain.handle('ai:get-approvals',    () => approvalEngine.getPendingApprovals?.() || []);
+ipcMain.handle('tab:setRightOverlayWidth', (_, width) => {
+  if (tabManager && typeof tabManager.setRightOverlayWidth === 'function') {
+    tabManager.setRightOverlayWidth(width);
+  }
+  return true;
+});
 
 // Audit log
 ipcMain.handle('ai:get-logs', (_, limit = 50) => auditLog.getLogs(limit));
@@ -758,17 +778,33 @@ ipcMain.handle('app:clear-data', async () => {
   return { success: true };
 });
 
-ipcMain.handle('app:save-keys', async (e, keys) => {
-  const { default: Store } = require('electron-store');
-  const store = new Store({ name: 'config' });
-  if (keys.primaryKey) store.set('groqKey', keys.primaryKey);
-  if (keys.secondaryKey) store.set('groqKeySecondary', keys.secondaryKey);
+ipcMain.handle('app:copy', (_, text) => {
+  clipboard.writeText(String(text ?? ''));
   return { success: true };
 });
 
+ipcMain.handle('app:save-keys', async (e, keys) => {
+  const { default: Store } = require('electron-store');
+  const store = new Store({ name: 'config' });
+  for (const key of ['cloudflareAccountId', 'cloudflareApiKey', 'groqKey']) {
+    if (typeof keys?.[key] === 'string') store.set(key, keys[key].trim());
+  }
+  return { success: true };
+});
+
+ipcMain.handle('app:get-keys', async () => {
+  const { default: Store } = require('electron-store');
+  const store = new Store({ name: 'config' });
+  return {
+    cloudflareAccountId: store.get('cloudflareAccountId', ''),
+    cloudflareApiKey: store.get('cloudflareApiKey', ''),
+    groqKey: store.get('groqKey', ''),
+  };
+});
+
 ipcMain.handle('auth:google-signin',  async () => {
-  try { await googleAuth.signIn(); return { success: true }; }
-  catch (err) { return { success: false, error: err.message }; }
+  try { const result = await googleAuth.signIn(); return result; }
+  catch (e) { return { success: false, error: e.message }; }
 });
 
 ipcMain.handle('auth:google-profile', async () => {

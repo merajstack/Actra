@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Search, Sparkles, Plus, X, Globe, MoreVertical, Edit2, Trash2, LogOut } from 'lucide-react';
+import { Search, Sparkles, Plus, X, Globe, MoreVertical, Edit2, Trash2 } from 'lucide-react';
+import { supabase } from '../lib/supabase';
 
 interface Shortcut {
   id: string;
@@ -18,23 +19,27 @@ const DEFAULT_SHORTCUTS: Shortcut[] = [
 interface NewTabPageProps {
   onNavigate: (url: string) => void;
   isIncognito?: boolean;
-  userProfile?: { displayName: string; avatarUrl?: string } | null;
-  onLogout?: () => void;
 }
 
-export const NewTabPage: React.FC<NewTabPageProps> = ({ onNavigate, isIncognito, userProfile, onLogout }) => {
+export const NewTabPage: React.FC<NewTabPageProps> = ({ onNavigate, isIncognito }) => {
   const [searchQuery, setSearchQuery] = useState('');
-  const [shortcuts, setShortcuts] = useState<Shortcut[]>(() => {
-    const saved = localStorage.getItem('actra_shortcuts');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error('Failed to parse shortcuts', e);
+  const [shortcuts, setShortcuts] = useState<Shortcut[]>(DEFAULT_SHORTCUTS);
+  const [isLoaded, setIsLoaded] = useState(false);
+
+  useEffect(() => {
+    const fetchShortcuts = async () => {
+      const { data } = await supabase.from('settings').select('value').eq('key', 'actra_shortcuts').single();
+      if (data?.value) {
+        try {
+          setShortcuts(typeof data.value === 'string' ? JSON.parse(data.value) : data.value);
+        } catch (e) {
+          console.error('Failed to parse shortcuts', e);
+        }
       }
-    }
-    return DEFAULT_SHORTCUTS;
-  });
+      setIsLoaded(true);
+    };
+    fetchShortcuts();
+  }, []);
 
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingShortcut, setEditingShortcut] = useState<Shortcut | null>(null);
@@ -42,8 +47,10 @@ export const NewTabPage: React.FC<NewTabPageProps> = ({ onNavigate, isIncognito,
   const [newUrl, setNewUrl] = useState('');
 
   useEffect(() => {
-    localStorage.setItem('actra_shortcuts', JSON.stringify(shortcuts));
-  }, [shortcuts]);
+    if (isLoaded) {
+      supabase.from('settings').upsert({ key: 'actra_shortcuts', value: shortcuts });
+    }
+  }, [shortcuts, isLoaded]);
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
@@ -136,30 +143,6 @@ export const NewTabPage: React.FC<NewTabPageProps> = ({ onNavigate, isIncognito,
 
   return (
     <div className="flex-1 bg-[#FDFBF7] flex flex-col items-center justify-center p-8 select-none overflow-y-auto relative">
-      {/* Profile Badge */}
-      {userProfile && (
-        <div className="absolute top-6 right-8 flex items-center gap-2 animate-in fade-in z-50">
-          <div className="flex items-center gap-3 bg-white px-4 py-2 rounded-full border border-zinc-200 shadow-sm">
-            {userProfile.avatarUrl ? (
-              <img src={userProfile.avatarUrl} alt="Profile" className="w-7 h-7 rounded-full shadow-sm" />
-            ) : (
-              <div className="w-7 h-7 rounded-full bg-orange-100 flex items-center justify-center text-orange-600 font-medium text-xs">
-                {userProfile.displayName?.charAt(0).toUpperCase()}
-              </div>
-            )}
-            <span className="text-sm font-medium text-zinc-700">{userProfile.displayName}</span>
-          </div>
-          {onLogout && (
-            <button 
-              onClick={onLogout}
-              className="p-2.5 rounded-full bg-white hover:bg-red-50 text-zinc-400 hover:text-red-500 border border-zinc-200 shadow-sm transition-colors cursor-pointer"
-              title="Sign Out & Clear Data"
-            >
-              <LogOut className="w-4 h-4" />
-            </button>
-          )}
-        </div>
-      )}
 
       <div className="w-full max-w-2xl flex flex-col items-center space-y-8 my-auto">
         {/* Logo & Title */}

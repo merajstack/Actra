@@ -13,6 +13,7 @@ import { HelpPage } from './components/HelpPage';
 import { DevToolsPanel } from './components/DevToolsPanel';
 import { FindInPageBar } from './components/FindInPageBar';
 import { BrowserContent } from './components/BrowserContent';
+import { supabase } from './lib/supabase';
 
 // AI Components
 import { AIChat } from './components/ai/AIChat';
@@ -64,16 +65,24 @@ export default function App() {
   const [activeTabId, setActiveTabId] = useState('tab-1');
   const [browserMode, setBrowserMode] = useState<BrowserMode>('browser');
 
-  const [isOnboardingComplete, setIsOnboardingComplete] = useState(
-    () => localStorage.getItem('onboardingComplete') === 'true'
-  );
-  
-  const [userProfile, setUserProfile] = useState<{ displayName: string; avatarUrl?: string }>(
-    () => {
-      const stored = localStorage.getItem('userProfile');
-      return stored ? JSON.parse(stored) : null;
-    }
-  );
+  const [isOnboardingComplete, setIsOnboardingComplete] = useState(false);
+  const [isCheckingOnboarding, setIsCheckingOnboarding] = useState(true);
+  const [isVisualAnalyzing, setIsVisualAnalyzing] = useState(false);
+
+  const [userProfile, setUserProfile] = useState<{ displayName: string; avatarUrl?: string } | null>(null);
+
+  useEffect(() => {
+    const fetchSettings = async () => {
+      const { data } = await supabase.from('settings').select('key, value').in('key', ['onboardingComplete', 'userProfile']);
+      if (data) {
+        const settings = data.reduce((acc, curr) => ({ ...acc, [curr.key]: curr.value }), {} as any);
+        if (settings.onboardingComplete === 'true') setIsOnboardingComplete(true);
+        if (settings.userProfile) setUserProfile(settings.userProfile);
+      }
+      setIsCheckingOnboarding(false);
+    };
+    fetchSettings();
+  }, []);
   
   const [bookmarks, setBookmarks] = useState<Bookmark[]>(INITIAL_BOOKMARKS);
   const [folders, setFolders] = useState(INITIAL_FOLDERS);
@@ -88,6 +97,7 @@ export default function App() {
   const [showCommandBar, setShowCommandBar] = useState(false);
   const [showVoiceBar, setShowVoiceBar] = useState(false);
   const [showAIPanel, setShowAIPanel] = useState(false);
+  const [chromeHeight, setChromeHeight] = useState(122);
   const [virtualCursorURL, setVirtualCursorURL] = useState<string | null>(null);
   const [approvals, setApprovals] = useState<AIApprovalRequest[]>([]);
 
@@ -102,6 +112,7 @@ export default function App() {
     const measure = () => {
       if (headerRef.current) {
         const h = headerRef.current.getBoundingClientRect().height;
+        setChromeHeight(Math.round(h));
         if (typeof (window as any).electronAPI.setUIChromeHeight === 'function') {
           (window as any).electronAPI.setUIChromeHeight(Math.round(h));
         }
@@ -111,6 +122,11 @@ export default function App() {
     window.addEventListener('resize', measure);
     return () => window.removeEventListener('resize', measure);
   }, [isElectron]);
+
+  useEffect(() => {
+    if (!isElectron || typeof (window as any).electronAPI.setRightOverlayWidth !== 'function') return;
+    (window as any).electronAPI.setRightOverlayWidth(showAIPanel ? 452 : 0);
+  }, [isElectron, showAIPanel]);
 
   // Initialize Electron tab
   useEffect(() => {
@@ -156,15 +172,50 @@ export default function App() {
     });
     (window as any).electronAPI.onDownloadProgress((data: any) => {
       setDownloads(prev => {
-        const exists = prev.find(d => d.fileName === data.fileName);
+        const exists = prev.find(d => d.filename === data.fileName);
         if (exists) {
-          return prev.map(d => d.fileName === data.fileName ? { ...d, progress: data.percent, status: 'downloading' } : d);
+          return prev.map(d => d.filename === data.fileName ? {
+            ...d,
+            receivedBytes: data.received,
+            totalBytes: data.total,
+            state: 'progressing',
+          } : d);
         }
-        return [{ id: `dl-${Date.now()}`, fileName: data.fileName, url: '', progress: data.percent, status: 'downloading', startTime: Date.now() }, ...prev];
+        return [{
+          id: `dl-${Date.now()}`,
+          filename: data.fileName,
+          url: data.sourceUrl || '',
+          sourceUrl: data.sourceUrl,
+          fileSize: data.total ? `${(data.total / 1024 / 1024).toFixed(1)} MB` : 'Downloading',
+          receivedBytes: data.received || 0,
+          totalBytes: data.total || 0,
+          state: 'progressing',
+          startTime: Date.now(),
+        }, ...prev];
       });
     });
     (window as any).electronAPI.onDownloadComplete((data: any) => {
-      setDownloads(prev => prev.map(d => d.fileName === data.fileName ? { ...d, progress: 100, status: 'completed' } : d));
+      setDownloads(prev => {
+        const completed = {
+          localPath: data.localPath,
+          sourceUrl: data.sourceUrl,
+          mimeType: data.mimeType,
+          receivedBytes: data.total || 0,
+          totalBytes: data.total || 0,
+          state: 'completed' as const,
+        };
+        if (prev.some(d => d.filename === data.fileName)) {
+          return prev.map(d => d.filename === data.fileName ? { ...d, ...completed } : d);
+        }
+        return [{
+          id: `dl-${Date.now()}`,
+          filename: data.fileName,
+          url: data.sourceUrl || '',
+          fileSize: data.total ? `${(data.total / 1024 / 1024).toFixed(1)} MB` : 'Completed',
+          startTime: Date.now(),
+          ...completed,
+        }, ...prev];
+      });
     });
   }, [isElectron]);
 
@@ -480,6 +531,16 @@ export default function App() {
     }
   };
 
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    await supabase.from('settings').delete().in('key', ['onboardingComplete', 'userProfile']);
+    if (isElectron && typeof (window as any).electronAPI.clearData === 'function') {
+      await (window as any).electronAPI.clearData();
+    }
+    setUserProfile(null);
+    setIsOnboardingComplete(false);
+  };
+
   const isBookmarked = bookmarks.some(b => b.url === activeTab.url);
 
   return (
@@ -544,6 +605,8 @@ export default function App() {
           downloads={downloads}
           history={history}
           bookmarks={bookmarks}
+          userProfile={userProfile}
+          onLogout={handleLogout}
         />
 
         {/* Bookmarks Bar */}
@@ -597,7 +660,7 @@ export default function App() {
             onLogout={async () => {
               setIsOnboardingComplete(false);
               setUserProfile(null);
-              localStorage.clear();
+              await supabase.from('settings').delete().in('key', ['onboardingComplete', 'userProfile', 'cloudflareAccountId', 'cloudflareApiKey', 'groqKey']);
               if (isElectron) {
                 await (window as any).electronAPI.clearData();
               }
@@ -625,9 +688,21 @@ export default function App() {
         )}
       </div>
 
+      {isVisualAnalyzing && (
+        <div className="absolute inset-0 bg-blue-500/20 z-[9999] flex items-center justify-center pointer-events-none transition-all duration-300">
+          <div className="bg-blue-600/90 text-white px-6 py-3 rounded-full font-semibold shadow-xl flex items-center space-x-3 backdrop-blur-sm border border-blue-400">
+             <svg className="w-5 h-5 animate-spin text-blue-100" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+             <span className="tracking-wide text-sm">Actra is analyzing the screen...</span>
+          </div>
+        </div>
+      )}
+
       {/* AI Chat Panel (Floating) */}
       {showAIPanel && !activeTab.isIncognito && (
-        <div className="absolute right-4 top-4 bottom-4 z-50">
+        <div
+          className="absolute right-4 bottom-4 z-50"
+          style={{ top: `${chromeHeight + 12}px` }}
+        >
           <AIChat 
             activeTabId={activeTabId} 
             onClose={() => setShowAIPanel(false)} 
@@ -653,12 +728,16 @@ export default function App() {
       {/* Virtual Cursor for AI UI Interaction */}
       <VirtualCursor visible={!!virtualCursorURL} url={virtualCursorURL || ''} />
 
-      {!isOnboardingComplete && (
+      {!isCheckingOnboarding && !isOnboardingComplete && (
         <OnboardingPage
+          userProfile={userProfile}
           onGoogleSignIn={async () => {
             if (isElectron) {
               const res = await (window as any).electronAPI.signInWithGoogle();
               if (res.success) {
+                if (res.id_token) {
+                  await supabase.auth.signInWithIdToken({ provider: 'google', token: res.id_token });
+                }
                 const profileRes = await (window as any).electronAPI.getGoogleProfile();
                 if (profileRes.success) {
                   setUserProfile(prev => ({
@@ -672,24 +751,31 @@ export default function App() {
               }
             }
           }}
-          onComplete={(data) => {
-            localStorage.setItem('groqKey', data.primaryKey);
-            if (data.secondaryKey) localStorage.setItem('groqKeySecondary', data.secondaryKey);
-            
+          onComplete={async (data) => {
+            const settingsToSave = [
+              { key: 'onboardingComplete', value: 'true' }
+            ];
+            if (data.groqKey) settingsToSave.push({ key: 'groqKey', value: data.groqKey });
+
             if (isElectron) {
-              (window as any).electronAPI.saveKeys({ primaryKey: data.primaryKey, secondaryKey: data.secondaryKey });
+              await (window as any).electronAPI.saveKeys({ 
+                cloudflareAccountId: data.cloudflareAccountId, 
+                cloudflareApiKey: data.cloudflareApiKey, 
+                groqKey: data.groqKey 
+              });
             }
-            
+
             setUserProfile(prev => {
               const finalProfile = {
-                displayName: prev?.avatarUrl ? prev.displayName : data.displayName,
+                displayName: prev?.displayName || 'Actra User',
                 avatarUrl: prev?.avatarUrl
               };
-              localStorage.setItem('userProfile', JSON.stringify(finalProfile));
+              settingsToSave.push({ key: 'userProfile', value: finalProfile as any });
               return finalProfile;
             });
             
-            localStorage.setItem('onboardingComplete', 'true');
+            await supabase.from('settings').upsert(settingsToSave);
+
             setIsOnboardingComplete(true);
           }}
         />

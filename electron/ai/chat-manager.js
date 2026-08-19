@@ -3,20 +3,24 @@
  *
  * Stores conversation history and manages active chat sessions.
  */
-const { default: Store } = require('electron-store');
+const supabase = require('../supabase');
 
 class ChatManager {
   constructor() {
-    this.store = new Store({ name: 'ai-chat-history' });
-    this.activeSessionId = this.store.get('activeSessionId', null);
+    this.activeSessionId = null;
+    this._initSession();
+  }
+
+  async _initSession() {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'activeSessionId').single();
+    this.activeSessionId = data?.value || null;
     
-    // Create an initial session if none exists
-    if (!this.activeSessionId || !this.getSession(this.activeSessionId)) {
-      this.createSession('New Chat');
+    if (!this.activeSessionId || !(await this.getSession(this.activeSessionId))) {
+      await this.createSession('New Chat');
     }
   }
 
-  createSession(title = 'New Chat') {
+  async createSession(title = 'New Chat') {
     const id = 'chat_' + Date.now() + Math.random().toString(36).substr(2, 6);
     const session = {
       id,
@@ -25,28 +29,35 @@ class ChatManager {
       updatedAt: Date.now(),
     };
     
-    this.store.set(`sessions.${id}`, session);
+    await supabase.from('chat_sessions').insert([{ id, session_data: session }]);
     this.activeSessionId = id;
-    this.store.set('activeSessionId', id);
+    await supabase.from('settings').upsert([{ key: 'activeSessionId', value: id }]);
     
     return session;
   }
 
-  getSession(id) {
-    return this.store.get(`sessions.${id}`, null);
+  async getSession(id) {
+    const { data } = await supabase.from('chat_sessions').select('session_data').eq('id', id).single();
+    return data?.session_data || null;
   }
 
-  getActiveSession() {
-    if (!this.activeSessionId) return this.createSession();
-    return this.getSession(this.activeSessionId);
+  async getActiveSession() {
+    let session = null;
+    if (this.activeSessionId) {
+      session = await this.getSession(this.activeSessionId);
+    }
+    if (!session) {
+      session = await this.createSession();
+    }
+    return session || { id: 'fallback', title: 'New Chat', messages: [], updatedAt: Date.now() };
   }
   
-  clearActiveSession() {
-    this.createSession('New Chat');
+  async clearActiveSession() {
+    await this.createSession('New Chat');
   }
 
-  addMessage(role, content, extras = {}) {
-    const session = this.getActiveSession();
+  async addMessage(role, content, extras = {}) {
+    const session = await this.getActiveSession();
     if (!session) return null;
 
     const message = {
@@ -60,12 +71,11 @@ class ChatManager {
     session.messages.push(message);
     session.updatedAt = Date.now();
     
-    // Auto-generate title for the first user message
     if (session.messages.length === 1 && role === 'user') {
       session.title = content.substring(0, 30) + (content.length > 30 ? '...' : '');
     }
 
-    this.store.set(`sessions.${session.id}`, session);
+    await supabase.from('chat_sessions').update({ session_data: session }).eq('id', session.id);
     
     if (global.mainWindow && !global.mainWindow.isDestroyed()) {
       global.mainWindow.webContents.send('ai:chat-updated', session);
@@ -74,8 +84,8 @@ class ChatManager {
     return message;
   }
   
-  updateMessage(messageId, updates) {
-    const session = this.getActiveSession();
+  async updateMessage(messageId, updates) {
+    const session = await this.getActiveSession();
     if (!session) return false;
     
     const msg = session.messages.find(m => m.id === messageId);
@@ -83,7 +93,8 @@ class ChatManager {
     
     Object.assign(msg, updates);
     session.updatedAt = Date.now();
-    this.store.set(`sessions.${session.id}`, session);
+    
+    await supabase.from('chat_sessions').update({ session_data: session }).eq('id', session.id);
     
     if (global.mainWindow && !global.mainWindow.isDestroyed()) {
       global.mainWindow.webContents.send('ai:chat-updated', session);
@@ -92,8 +103,8 @@ class ChatManager {
     return true;
   }
 
-  getHistory() {
-    const session = this.getActiveSession();
+  async getHistory() {
+    const session = await this.getActiveSession();
     return session ? session.messages : [];
   }
 }

@@ -40,6 +40,9 @@ export interface DownloadItem {
   id: string;
   filename: string;
   url: string;
+  sourceUrl?: string;
+  localPath?: string;
+  mimeType?: string;
   fileSize: string;
   receivedBytes: number;
   totalBytes: number;
@@ -82,6 +85,8 @@ export interface AITaskStep {
   status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
   output?: string;
   phase?: string;
+  screenshot?: string;
+  predictedTarget?: { x: number; y: number };
 }
 
 export interface AITask {
@@ -100,6 +105,12 @@ export interface AITask {
     required_apps: string[];
     approval_required: boolean;
   };
+}
+
+export interface AIProviderSettings {
+  cloudflareAccountId: string;
+  cloudflareApiKey: string;
+  groqKey: string;
 }
 
 // ─── Approval ────────────────────────────────────────────────────────────────

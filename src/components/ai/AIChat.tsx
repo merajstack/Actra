@@ -90,53 +90,76 @@ const ApprovalCard: React.FC<any> = ({ approval, onApprove, onReject, onEdit }) 
 };
 
 // ─── Task Progress ────────────────────────────────────────────────────────
-const TaskProgress: React.FC<{ taskId: string, tasks: AITask[] }> = ({ taskId, tasks }) => {
+const TaskProgress: React.FC<{ taskId: string, tasks: AITask[], fallbackContent?: string }> = ({ taskId, tasks, fallbackContent }) => {
   const task = tasks.find(t => t.id === taskId);
-  if (!task) return <Loader2 className="w-4 h-4 text-orange-500 animate-spin" />;
+  if (!task) return <div className="text-[13px] text-black font-medium">Starting request...</div>;
 
   const isFailed = task.status === 'failed' || task.status === 'rejected';
   const isActive = !['completed', 'failed', 'cancelled', 'rejected'].includes(task.status);
-  
-  if (task.status === 'completed' && task.outputs) {
-    return <div className="text-[13px] text-zinc-800 leading-relaxed whitespace-pre-wrap">{task.outputs}</div>;
+
+  if (task.status === 'completed') {
+    return <div className="text-[13px] text-black leading-relaxed whitespace-pre-wrap font-normal">{task.outputs || fallbackContent || 'Task completed, but Actra returned an empty response.'}</div>;
   }
-  
+
   if (isFailed && task.error) {
-    return <div className="text-[13px] text-red-700 bg-red-50 p-3 rounded-lg border border-red-200">{task.error}</div>;
+    return <div className="text-[13px] text-red-700 bg-red-50 p-3 rounded-lg border border-red-200 font-medium">{task.error}</div>;
+  }
+
+  if (isFailed || task.status === 'cancelled') {
+    return <div className="text-[13px] text-red-700 bg-red-50 p-3 rounded-lg border border-red-200 font-medium">
+      {task.status === 'cancelled' ? 'Request cancelled.' : 'Actra could not complete this request.'}
+    </div>;
   }
 
   return (
-    <div className="space-y-2 w-full">
+    <div className="space-y-2 w-full text-black">
       <div className="flex items-center space-x-2">
         {isActive && <Loader2 className="w-4 h-4 text-orange-500 animate-spin" />}
-        <span className="text-xs font-medium text-orange-600">
-          {task.status === 'understanding' ? 'Understanding request...' : 
-           task.status === 'planning' ? 'Planning...' : 
-           task.status === 'gathering' ? 'Gathering context...' : 
-           task.status === 'waiting_approval' ? 'Waiting for approval...' : 
+        <span className="text-xs font-semibold text-orange-700">
+          {task.status === 'understanding' ? 'Understanding request...' :
+           task.status === 'planning' ? 'Planning...' :
+           task.status === 'gathering' ? 'Gathering context...' :
+           task.status === 'waiting_approval' ? 'Waiting for approval...' :
            task.status === 'executing' ? 'Executing actions...' : 'Working...'}
         </span>
       </div>
       {task.steps.map(step => (
-        <div key={step.id} className="flex items-start space-x-2 text-[11px] opacity-70">
-          <span className="mt-0.5">{step.status === 'completed' ? '✓' : step.status === 'running' ? '▶' : '·'}</span>
-          <span>{step.description}</span>
+        <div key={step.id} className="flex flex-col items-start space-y-1 text-[12px] text-black mb-2">
+          <div className="flex items-center space-x-2 text-black">
+            <span className="mt-0.5 font-bold">{step.status === 'completed' ? '✓' : step.status === 'running' ? '▶' : step.status === 'failed' ? '❌' : '·'}</span>
+            <span className="text-black font-medium">{step.description}</span>
+          </div>
+          {step.screenshot && (
+            <div className="relative mt-2 rounded-md overflow-hidden border border-zinc-200 shadow-sm self-stretch max-w-full">
+              <img src={step.screenshot} alt="Agent View" className="w-full object-contain bg-zinc-950" style={{ maxHeight: '200px' }} />
+              {step.predictedTarget && (
+                <div
+                  className="absolute w-4 h-4 rounded-full border-2 border-red-500 bg-red-500/30 flex items-center justify-center transform -translate-x-1/2 -translate-y-1/2 pointer-events-none shadow-[0_0_8px_rgba(239,68,68,0.8)]"
+                  style={{
+                    // This assumes the screenshot is displayed at natural aspect ratio.
+                    // For perfect precision, we'd need exact CSS dimension scaling, but this gives the visual gist:
+                    left: `${(step.predictedTarget.x / 1440) * 100}%`, // Rough estimate based on standard 1440px width
+                    top: `${(step.predictedTarget.y / 900) * 100}%`
+                  }}
+                >
+                  <div className="w-0.5 h-full bg-red-500 absolute"></div>
+                  <div className="h-0.5 w-full bg-red-500 absolute"></div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       ))}
     </div>
   );
 };
 
-export const AIChat: React.FC<{ 
-  onClose: () => void; 
-  activeTabId: string; 
-  approvals: AIApprovalRequest[];
-  setApprovals: React.Dispatch<React.SetStateAction<AIApprovalRequest[]>>;
-}> = ({ onClose, activeTabId, approvals, setApprovals }) => {
+export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({ onClose, activeTabId }) => {
   const [isExpanded, setIsExpanded] = useState(false);
   const [session, setSession] = useState<ChatSession | null>(null);
   const [input, setInput] = useState('');
   const [tasks, setTasks] = useState<AITask[]>([]);
+  const [approvals, setApprovals] = useState<AIApprovalRequest[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
@@ -146,7 +169,7 @@ export const AIChat: React.FC<{
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const baseTextRef = useRef<string>('');
-  
+
   const api = (window as any).electronAPI;
 
   const loadHistory = async () => {
@@ -158,6 +181,7 @@ export const AIChat: React.FC<{
   useEffect(() => {
     loadHistory();
     api.getTasks().then(setTasks);
+    api.getApprovals().then(setApprovals);
 
     api.onAIChatUpdated((updatedSession: ChatSession) => {
       setSession(updatedSession);
@@ -176,6 +200,14 @@ export const AIChat: React.FC<{
         }
       }, 100);
     });
+
+    api.onAIRequireApproval((approval: AIApprovalRequest) => {
+      setApprovals(prev => {
+        const exists = prev.some(a => a.id === approval.id);
+        return exists ? prev : [approval, ...prev];
+      });
+      setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
+    });
   }, []);
 
   const handleSend = async (e?: React.FormEvent) => {
@@ -183,10 +215,45 @@ export const AIChat: React.FC<{
     if (!input.trim()) return;
     const msg = input.trim();
     setInput('');
-    await api.sendChatMessage(msg, activeTabId);
+    setSession(prev => ({
+      id: prev?.id || 'active',
+      title: prev?.title || 'Chat',
+      messages: [...(prev?.messages || []), {
+        id: `local-${Date.now()}`,
+        role: 'user',
+        content: msg,
+        timestamp: Date.now(),
+      }],
+      updatedAt: Date.now(),
+    }));
+    try {
+      await api.sendChatMessage(msg, activeTabId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setSession(prev => ({
+        id: prev?.id || 'active',
+        title: prev?.title || 'Chat',
+        messages: [...(prev?.messages || []), {
+          id: `local-error-${Date.now()}`,
+          role: 'assistant',
+          content: `Actra could not start this request: ${message}`,
+          timestamp: Date.now(),
+        }],
+        updatedAt: Date.now(),
+      }));
+    }
   };
 
   const handleClear = async () => {
+    if (api.cancelAllTasks) {
+      await api.cancelAllTasks();
+    } else {
+      await Promise.all(
+        tasks
+          .filter(t => !['completed', 'failed', 'cancelled', 'rejected'].includes(t.status))
+          .map(t => api.cancelTask(t.id))
+      );
+    }
     const history = await api.clearChat();
     setSession({ id: 'active', title: 'Chat', messages: history, updatedAt: Date.now() });
     setTasks([]);
@@ -213,7 +280,7 @@ export const AIChat: React.FC<{
         mediaRecorderRef.current.stop();
       }
       if (mediaStreamRef.current) { mediaStreamRef.current.getTracks().forEach(t => t.stop()); mediaStreamRef.current = null; }
-      
+
       setIsRecording(false);
 
       // Wait a brief moment for the final ondataavailable event to fire
@@ -224,7 +291,7 @@ export const AIChat: React.FC<{
         try {
           const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
           const arrayBuffer = await blob.arrayBuffer();
-          
+
           const audioCtx = new AudioContext({ sampleRate: 16000 });
           const decodedData = await audioCtx.decodeAudioData(arrayBuffer);
           const float32Audio = decodedData.getChannelData(0);
@@ -245,11 +312,11 @@ export const AIChat: React.FC<{
           setInput(baseTextRef.current);
         }
       }
-      
+
       inputRef.current?.focus();
       return;
     }
-    
+
     setIsRecording(true);
     baseTextRef.current = input;
     if (baseTextRef.current && !baseTextRef.current.endsWith(' ')) baseTextRef.current += ' ';
@@ -258,7 +325,7 @@ export const AIChat: React.FC<{
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
-      
+
       const mediaRecorder = new MediaRecorder(stream);
       mediaRecorderRef.current = mediaRecorder;
 
@@ -276,7 +343,7 @@ export const AIChat: React.FC<{
   };
 
   return (
-    <div className={`${isExpanded ? 'w-[600px]' : 'w-[420px]'} transition-all duration-300 h-[calc(100%-2rem)] mt-4 mr-4 bg-white rounded-2xl border border-[#E8E2D5] flex flex-col shadow-[0_8px_30px_rgb(0,0,0,0.12)] z-50 overflow-hidden shrink-0`}>
+    <div className={`${isExpanded ? 'w-[600px]' : 'w-[420px]'} transition-all duration-300 h-full bg-white rounded-2xl border border-[#E8E2D5] flex flex-col shadow-[0_18px_60px_rgba(0,0,0,0.24)] z-[100000] overflow-hidden shrink-0`}>
       {/* Header */}
       <div className="h-14 border-b border-[#E8E2D5] flex items-center justify-between px-5 shrink-0 bg-[#FDFBF7]">
         <div className="flex items-center space-x-2 text-zinc-900 font-bold">
@@ -304,7 +371,7 @@ export const AIChat: React.FC<{
             <p className="text-sm font-medium">How can I help you today?</p>
           </div>
         )}
-        
+
         {session?.messages.map((msg, idx) => {
           const isUser = msg.role === 'user';
           const taskApprovals = msg.taskId ? approvals.filter(a => a.taskId === msg.taskId) : [];
@@ -316,39 +383,59 @@ export const AIChat: React.FC<{
                   <Sparkles className="w-3.5 h-3.5 text-orange-600" />
                 </div>
               )}
-              
-              <div className={`max-w-[85%] relative ${isUser ? 'bg-zinc-900 text-white px-4 py-2.5 rounded-2xl rounded-tr-sm' : 'text-zinc-800'}`}>
+
+              <div className={`max-w-[85%] relative ${isUser ? 'bg-[#F2EFE9] text-black border border-[#E0DACB] px-4 py-2.5 rounded-2xl rounded-tr-sm shadow-sm' : 'bg-[#FAF8F5] text-black border border-[#E8E2D5] px-4 py-2.5 rounded-2xl rounded-tl-sm shadow-sm'}`}>
                 {isUser ? (
-                  <div className="text-[13px] leading-relaxed whitespace-pre-wrap">{msg.content}</div>
+                  <div className="text-[13px] text-black leading-relaxed whitespace-pre-wrap font-medium">{msg.content}</div>
                 ) : (
-                  <div className="space-y-3">
+                  <div className="space-y-3 text-black">
                     {msg.taskId ? (
-                      <TaskProgress taskId={msg.taskId} tasks={tasks} />
+                      <TaskProgress taskId={msg.taskId} tasks={tasks} fallbackContent={msg.content} />
                     ) : (
-                      <div className="text-[13px] leading-relaxed whitespace-pre-wrap">{msg.content}</div>
+                      <div className="text-[13px] text-black leading-relaxed whitespace-pre-wrap font-normal">{msg.content}</div>
                     )}
 
                     {/* Render Approvals Inline */}
                     {taskApprovals.map(approval => (
-                      <ApprovalCard 
-                        key={approval.id} 
-                        approval={approval} 
-                        onApprove={handleApprove} 
-                        onReject={handleReject} 
-                        onEdit={handleEdit} 
+                      <ApprovalCard
+                        key={approval.id}
+                        approval={approval}
+                        onApprove={handleApprove}
+                        onReject={handleReject}
+                        onEdit={handleEdit}
                       />
                     ))}
                   </div>
                 )}
-                
+
                 {/* Copy Button (Shows on Hover) */}
                 <button
-                  onClick={() => {
-                    navigator.clipboard.writeText(msg.content);
-                    setCopiedId(msg.id);
-                    setTimeout(() => setCopiedId(null), 2000);
+                  onClick={async () => {
+                    let finalContent = msg.taskId && tasks.find(t => t.id === msg.taskId)?.outputs
+                      ? tasks.find(t => t.id === msg.taskId)?.outputs
+                      : msg.content;
+
+                    if (typeof finalContent === 'object') {
+                      finalContent = JSON.stringify(finalContent, null, 2);
+                    } else if (typeof finalContent !== 'string') {
+                      finalContent = String(finalContent || '');
+                    }
+
+                    try {
+                      if ((window as any).electronAPI?.copyToClipboard) {
+                        await (window as any).electronAPI.copyToClipboard(finalContent);
+                      } else if (navigator.clipboard?.writeText) {
+                        await navigator.clipboard.writeText(finalContent);
+                      } else {
+                        throw new Error('Clipboard access is unavailable');
+                      }
+                      setCopiedId(msg.id);
+                      setTimeout(() => setCopiedId(null), 2000);
+                    } catch (error) {
+                      console.error('Copy failed:', error);
+                    }
                   }}
-                  className={`absolute opacity-0 group-hover:opacity-100 transition-opacity p-1.5 rounded-md shadow-sm border bg-white text-zinc-500 hover:text-zinc-700 hover:bg-zinc-50 ${isUser ? '-left-10 top-0 border-zinc-200' : '-right-10 top-0 border-zinc-200'}`}
+                  className={`absolute opacity-0 group-hover:opacity-100 transition-opacity p-1.5 rounded-md shadow-sm border bg-white text-zinc-500 hover:text-zinc-700 hover:bg-zinc-50 z-10 ${isUser ? 'left-1 top-1 border-zinc-700' : 'right-1 top-1 border-zinc-200'}`}
                   title={copiedId === msg.id ? "Copied!" : "Copy to clipboard"}
                 >
                   {copiedId === msg.id ? (
@@ -361,6 +448,33 @@ export const AIChat: React.FC<{
             </div>
           );
         })}
+
+        {/* Fallback for any approvals that didn't match a message's taskId */}
+        {(() => {
+          const matchedApprovalIds = new Set(
+            session?.messages.flatMap(msg =>
+              msg.taskId ? approvals.filter(a => a.taskId === msg.taskId).map(a => a.id) : []
+            ) || []
+          );
+          const unmatchedApprovals = approvals.filter(a => !matchedApprovalIds.has(a.id));
+
+          if (unmatchedApprovals.length === 0) return null;
+
+          return (
+            <div className="mt-4">
+              {unmatchedApprovals.map(approval => (
+                <ApprovalCard
+                  key={`fallback-${approval.id}`}
+                  approval={approval}
+                  onApprove={handleApprove}
+                  onReject={handleReject}
+                  onEdit={handleEdit}
+                />
+              ))}
+            </div>
+          );
+        })()}
+
         <div ref={messagesEndRef} />
       </div>
 
@@ -374,7 +488,7 @@ export const AIChat: React.FC<{
             onChange={e => setInput(e.target.value)}
             placeholder="Ask Actra AI..."
             autoFocus
-            className="w-full pl-4 pr-24 py-3 bg-white border border-zinc-200 rounded-xl text-sm focus:outline-none focus:border-orange-400 focus:ring-1 focus:ring-orange-400 shadow-sm"
+            className="w-full pl-4 pr-24 py-3 bg-white border border-zinc-300 rounded-xl text-sm text-black placeholder:text-zinc-500 focus:outline-none focus:border-orange-500 focus:ring-1 focus:ring-orange-500 shadow-sm font-normal"
           />
           <div className="absolute right-2 flex space-x-1 items-center">
             {tasks.some(t => !['completed', 'failed', 'cancelled', 'rejected'].includes(t.status)) ? (

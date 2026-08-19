@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setVisibility:   (tabId, visible) => ipcRenderer.invoke('tab:setVisibility', tabId, visible),
   setUIChromeHeight: (height) => ipcRenderer.invoke('tab:setUIChromeHeight', height),
   setSidebarWidth: (width) => ipcRenderer.invoke('tab:setSidebarWidth', width),
+  setRightOverlayWidth: (width) => ipcRenderer.invoke('tab:setRightOverlayWidth', width),
   reopenClosedTab: () => ipcRenderer.invoke('tab:reopenClosed'),
   duplicateTab:    (tabId) => ipcRenderer.invoke('tab:duplicate', tabId),
   isFullscreen:    () => ipcRenderer.invoke('window:isFullscreen'),
@@ -95,6 +96,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getChatHistory:  () => ipcRenderer.invoke('ai:get-chat-history'),
   clearChat:       () => ipcRenderer.invoke('ai:clear-chat'),
   cancelTask:      (taskId) => ipcRenderer.invoke('ai:cancel-task', taskId),
+  cancelAllTasks:  () => ipcRenderer.invoke('ai:cancel-all-tasks'),
 
   /** Approve an action */
   resolveApproval: (approvalId, approved) => ipcRenderer.invoke('ai:resolve-approval', approvalId, approved),
@@ -104,6 +106,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   getCompanions: () => ipcRenderer.invoke('ai:get-companions'),
   getTasks:      () => ipcRenderer.invoke('ai:get-tasks'),
+  getApprovals:  () => ipcRenderer.invoke('ai:get-approvals'),
 
   /** Get audit log entries */
   getAILogs: (limit) => ipcRenderer.invoke('ai:get-logs', limit),
@@ -133,6 +136,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getGoogleProfile:    () => ipcRenderer.invoke('auth:google-profile'),
   clearData:           () => ipcRenderer.invoke('app:clear-data'),
   saveKeys:            (keys) => ipcRenderer.invoke('app:save-keys', keys),
+  getKeys:             () => ipcRenderer.invoke('app:get-keys'),
+  copyToClipboard:     (text) => ipcRenderer.invoke('app:copy', text),
 
   // ─── Voice UI ─────────────────────────────────────────────────────────────
 

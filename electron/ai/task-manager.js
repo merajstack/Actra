@@ -46,6 +46,7 @@ class TaskManager extends EventEmitter {
   updateTaskStatus(id, status, details = {}) {
     const task = this.tasks.get(id);
     if (!task) return false;
+    if (task.status === 'cancelled' && status !== 'cancelled') return false;
 
     task.status = status;
     task.updatedAt = Date.now();
@@ -94,6 +95,15 @@ class TaskManager extends EventEmitter {
     return Array.from(this.tasks.values()).filter(
       t => !['completed', 'failed', 'cancelled', 'rejected'].includes(t.status)
     );
+  }
+
+  cancelAllActiveTasks() {
+    const cancelled = [];
+    for (const task of this.getAllActiveTasks()) {
+      this.updateTaskStatus(task.id, 'cancelled');
+      cancelled.push(task.id);
+    }
+    return { success: true, cancelled };
   }
 
   getAllTasks() {

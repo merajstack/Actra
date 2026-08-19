@@ -37,8 +37,8 @@ class PlannerEngine {
           enum: ['INFORMATIONAL', 'GOOGLE_WORKSPACE_API', 'BROWSER_UI'],
           description: 'The primary target platform for execution.'
         },
-        route: { 
-          type: 'string', 
+        route: {
+          type: 'string',
           enum: ['ACTION_SIMPLE', 'ACTION_COMPLEX'],
           description: 'Only applies if execution_target is BROWSER_UI. ACTION_SIMPLE for basic web navigation/clicks. ACTION_COMPLEX for research, scraping, or multi-step logic.'
         },
@@ -50,7 +50,7 @@ class PlannerEngine {
             properties: {
               action: { type: 'string', enum: ['browser_navigate', 'browser_type', 'browser_click', 'browser_press_key', 'browser_scroll'] },
               description: { type: 'string', description: 'Human-readable description (e.g. "Opening YouTube")' },
-              args: { 
+              args: {
                 type: 'object',
                 properties: {
                   url: { type: 'string' },
@@ -72,7 +72,7 @@ class PlannerEngine {
       required: ['intent', 'goal', 'execution_target', 'approval_required'],
     };
 
-    const historyContext = chatHistory.length > 0 
+    const historyContext = chatHistory.length > 0
       ? `\nConversation History:\n${chatHistory.map(m => `[${m.role.toUpperCase()}]: ${m.content}`).join('\n')}\n`
       : '';
 
@@ -85,6 +85,7 @@ Analyze this request and return a structured JSON understanding of what the user
 Available Workspace actions:
 READ (no approval needed): search_gmail, read_gmail_thread, get_calendar_events, read_sheet, search_drive
 WRITE (approval required): send_email, write_sheet, update_sheet, create_doc, create_calendar_event, update_calendar_event
+Browser read actions: browser_extract_page_text captures the readable text from the current page for later steps.
 
 Rules for Routing:
 
@@ -106,14 +107,16 @@ You must output an \`execution_target\` choosing from:
 - Use ONLY when the user explicitly requests UI interaction, or for external websites without a dedicated backend integration.
 - Examples of explicit UI requests: "Open Gmail", "Click the Inbox in Gmail", "Open this spreadsheet in the browser".
 - Examples of external websites: "Open YouTube and play a MrBeast video", "Search Google for laptops", "Scroll down the article".
+- Hybrid browser + Workspace requests MUST use BROWSER_UI if any external web page must be opened, searched, scrolled, or scraped, and MUST still list required Workspace apps such as "gmail" when the result will be emailed.
 - For BROWSER_UI, you MUST specify \`route\`:
   - ACTION_SIMPLE for deterministic steps.
   - ACTION_COMPLEX for multi-step reasoning web agents.
 - For ACTION_SIMPLE, you MUST populate \`simple_plan\` with the COMPLETE set of deterministic browser actions needed (browser_navigate, browser_type, browser_click, browser_press_key).
+- If the user asks to capture, scrape, extract, research, summarize, or email page content after browser navigation, use ACTION_COMPLEX, not ACTION_SIMPLE.
 - CRITICAL: If you type into a search box, you MUST include a \`browser_press_key\` step with key "Enter".
-- CRITICAL: You must complete the ENTIRE goal. If playing a video, always find and play the best relevant video from the search results (skip any ad videos).
+If the user says "send", "write", "create", "update", "draft" → approval_required = true
 
-If the user says "send", "write", "create", "update", "draft" → approval_required = true`;
+CRITICAL: YOU MUST OUTPUT ONLY RAW, VALID JSON. DO NOT WRAP YOUR RESPONSE IN MARKDOWN \`\`\`json BLOCKS. ANY TEXT OUTSIDE THE JSON WILL CAUSE A SYSTEM FAILURE.`;
 
     const { data } = await this.modelGateway.structuredOutput(prompt, schema);
     return data;
@@ -150,9 +153,8 @@ If the user says "send", "write", "create", "update", "draft" → approval_requi
             required: ['action', 'description', 'args', 'riskLevel'],
           },
         },
-        isComplete: { type: 'boolean', description: 'True ONLY if the user goal has been fully achieved. Otherwise false.' },
       },
-      required: ['interpretation', 'steps', 'isComplete'],
+      required: ['interpretation', 'steps'],
     };
 
     const toolDefs = availableTools.map(t => {
@@ -163,7 +165,7 @@ If the user says "send", "write", "create", "update", "draft" → approval_requi
       return `- ${t.name}: ${t.description}\n  Parameters:\n${paramList}`;
     }).join('\n\n');
 
-    const historyContext = chatHistory.length > 0 
+    const historyContext = chatHistory.length > 0
       ? `\nConversation History:\n${chatHistory.map(m => `[${m.role.toUpperCase()}]: ${m.content}`).join('\n')}\n`
       : '';
 
@@ -184,10 +186,59 @@ Available Tools:
 ${toolDefs}
 
 Create a MACRO-PLAN to complete the task. Rules:
-1. Generate the FULL SEQUENCE of deterministic actions needed (e.g. navigate -> type -> press Enter).
+1. Generate the sequence of deterministic actions needed (e.g. navigate -> type -> press Enter).
 2. For \`browser_click\` and \`browser_type\`, use a semantic description of the element (e.g. "search bar", "video thumbnail") in \`args.targetDescription\`. The local executor will find it. You do not need to provide exact element IDs.
 3. Keep descriptions clean for the UI (e.g. "Opening YouTube", "Searching for MrBeast").
-4. Assign riskLevel=0 for read ops, riskLevel=2 for write/send ops.`;
+4. Assign riskLevel=0 for read ops, riskLevel=2 for write/send ops.
+5. When a later step needs current page text, add \`browser_extract_page_text\` after the page is open and any requested scroll has happened.
+6. When sending extracted page text by email, set \`send_email.args.body\` to the placeholder string \`{{browser_extract_page_text.text}}\` so the executor can insert the captured text before approval.
+7. If the user asks for a known Wikipedia topic, prefer direct navigation to the canonical article URL, e.g. https://en.wikipedia.org/wiki/Tiger.
+- Ensure you provide ALL necessary arguments to the tool according to its schema.
+
+CRITICAL: YOU MUST OUTPUT ONLY RAW, VALID JSON. DO NOT WRAP YOUR RESPONSE IN MARKDOWN \`\`\`json BLOCKS. DO NOT ADD ANY CONVERSATIONAL TEXT.`;
+
+    const { data } = await this.modelGateway.structuredOutput(prompt, schema);
+    return data;
+  }
+
+  /**
+   * Hard Completion Gate: Verifies if the goal was objectively achieved based on DOM state.
+   */
+  async verifyTaskCompletion(intent, pageContext, executionHistory = []) {
+    if (!this.modelGateway.isAvailable()) {
+      return { goal_state_reached: false, reason: 'AI Model not available for verification.', missing_requirements: [] };
+    }
+
+    const schema = {
+      type: 'object',
+      properties: {
+        goal_state_reached: { type: 'boolean', description: 'True ONLY if the final desired outcome is visibly achieved' },
+        reason: { type: 'string', description: 'Explanation of why it is or is not complete' },
+        missing_requirements: { type: 'array', items: { type: 'string' }, description: 'Array of actions still needed (e.g. "Press Enter to submit search")' }
+      },
+      required: ['goal_state_reached', 'reason', 'missing_requirements'],
+    };
+
+    const executionHistoryContext = executionHistory.length > 0
+      ? `\nExecution History:\n${JSON.stringify(executionHistory, null, 2)}\n`
+      : '';
+
+    const prompt = `You are a strict QA verification gate.
+Your job is to objectively verify if the USER GOAL has been achieved based on the current FRESH browser state.
+
+USER GOAL: "${intent}"
+
+FRESH BROWSER STATE:
+${JSON.stringify(pageContext, null, 2)}
+${executionHistoryContext}
+
+RULES:
+1. "Action execution success" DOES NOT mean "Goal Success". If a query was typed but results aren't visible, the search task is NOT complete.
+2. If "scroll to bottom" was requested, check the \`scroll.atBottom\` property. Do not assume scrolling succeeded just because the command ran.
+3. Be pessimistic. If you do not see objective proof of completion (e.g., URL change, search results, confirmation messages), return goal_state_reached = false.
+4. If false, list the exact \`missing_requirements\` needed next so the planner knows what to do.
+
+Output raw JSON matching the schema.`;
 
     const { data } = await this.modelGateway.structuredOutput(prompt, schema);
     return data;

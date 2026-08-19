@@ -29,7 +29,7 @@ class TabManager {
    */
   createTab(url = 'https://www.google.com', isIncognito = false) {
     const tabId = `view-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    
+
     const view = new BrowserView({
       webPreferences: {
         nodeIntegration: false,
@@ -97,7 +97,7 @@ class TabManager {
     // Native Context Menu (Right-click)
     view.webContents.on('context-menu', (event, params) => {
       const template = [];
-      
+
       // Link context
       if (params.linkURL) {
         template.push({
@@ -284,7 +284,7 @@ class TabManager {
 
     this.activeTabId = tabId;
     const newView = this.tabs.get(tabId);
-    
+
     if (newView) {
       const url = newView.webContents.getURL();
       // Only show native BrowserView if we have real content (not about:blank / new tab)
@@ -292,7 +292,7 @@ class TabManager {
         this.mainWindow.addBrowserView(newView);
         this.updateViewBounds(newView);
       }
-      
+
       // Push current state to renderer (scoped to THIS tab only)
       this._sendTabState(tabId, newView);
     }
@@ -340,9 +340,25 @@ class TabManager {
   /**
    * Per-tab reload. Only affects the specified tab.
    */
-  reload(tabId) {
+  reloadTab(tabId) {
     const view = this.tabs.get(tabId);
     if (view) view.webContents.reload();
+  }
+
+  /**
+   * Captures a screenshot of the specified tab.
+   * Returns a base64 encoded PNG string.
+   */
+  async captureScreenshot(tabId) {
+    const view = this.tabs.get(tabId);
+    if (!view) return null;
+    try {
+      const image = await view.webContents.capturePage();
+      return image.toDataURL(); // e.g., "data:image/png;base64,..."
+    } catch (e) {
+      console.error('[TabManager] Screenshot capture failed:', e);
+      return null;
+    }
   }
 
   /**
@@ -453,11 +469,12 @@ class TabManager {
     const UI_CHROME = (this.uiChromeHeight !== undefined) ? this.uiChromeHeight : 88;
     const yOffset = UI_CHROME + extraOffset;
     const SIDEBAR_WIDTH = (this.sidebarWidth !== undefined) ? this.sidebarWidth : 0;
-    
+    const RIGHT_OVERLAY_WIDTH = (this.rightOverlayWidth !== undefined) ? this.rightOverlayWidth : 0;
+
     view.setBounds({
       x: SIDEBAR_WIDTH,
       y: yOffset,
-      width: Math.max(width - SIDEBAR_WIDTH, 100),
+      width: Math.max(width - SIDEBAR_WIDTH - RIGHT_OVERLAY_WIDTH, 100),
       height: Math.max(height - yOffset, 100)
     });
     view.setAutoResize({ width: true, height: true });
@@ -485,14 +502,14 @@ class TabManager {
   _sendTabState(tabId, view, url) {
     const nav = view.webContents.navigationHistory;
     const currentUrl = url || view.webContents.getURL();
-    
+
     // If the BrowserView hasn't fully loaded its initial URL yet, it returns an empty string.
     // We must ignore empty strings to prevent overwriting React's optimistic 'chrome://newtab' state.
     if (!currentUrl) return;
 
-    this._sendToRenderer('tab-updated', { 
-      tabId, 
-      url: currentUrl, 
+    this._sendToRenderer('tab-updated', {
+      tabId,
+      url: currentUrl,
       title: view.webContents.getTitle(),
       canGoBack: nav ? nav.canGoBack() : view.webContents.canGoBack(),
       canGoForward: nav ? nav.canGoForward() : view.webContents.canGoForward()

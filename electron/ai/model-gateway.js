@@ -12,13 +12,12 @@
 
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../../.env') });
+const supabase = require('../supabase');
 
 class ModelGateway {
   constructor() {
-    const { default: Store } = require('electron-store');
-    this.store = new Store({ name: 'config' });
     this.defaultModel = 'llama-3.1-8b-instant'; // fast default
-    this.reasoningModel = 'llama-3.1-8b-instant'; // Use 8B for everything to prevent 413
+    this.reasoningModel = 'llama-3.3-70b-versatile'; // powerful model
     this.baseUrl = 'https://api.groq.com/openai/v1/chat/completions';
     this.modelsUrl = 'https://api.groq.com/openai/v1/models';
     
@@ -29,17 +28,25 @@ class ModelGateway {
     this.fetchingModels = null;
   }
 
-  getApiKey() {
-    return this.store.get('groqKey') || process.env.GROQ_API_KEY;
+  async getApiKey() {
+    try {
+      const { default: Store } = await import('electron-store');
+      const localKey = new Store({ name: 'config' }).get('groqKey');
+      if (localKey) return localKey;
+    } catch (e) {}
+    try {
+      const { data } = await supabase.from('settings').select('value').eq('key', 'groqKey').single();
+      if (data?.value) return data.value;
+    } catch (e) {}
+    return process.env.GROQ_API_KEY;
   }
 
   isAvailable() {
-    const key = this.getApiKey();
-    return !!key && key !== 'YOUR_GROQ_API_KEY';
+    return true; // Cloudflare Qwen 30B is always available as first priority
   }
 
   async _fetchGroq(payload) {
-    const key = this.getApiKey();
+    const key = await this.getApiKey();
     if (!key || key === 'YOUR_GROQ_API_KEY') {
       throw new Error('Groq API Key is not configured. Please set GROQ_API_KEY in .env or via onboarding.');
     }
@@ -83,6 +90,108 @@ class ModelGateway {
     }
   }
 
+  async _fetchWithFallback(payload, isReasoning = false) {
+    try {
+      console.log(`[ModelGateway] Attempting Cloudflare AI: qwen3-30b`);
+      
+      let cfAccountId;
+      let cfApiToken;
+
+      try {
+        const { default: Store } = await import('electron-store');
+        const localStore = new Store({ name: 'config' });
+        cfAccountId = localStore.get('cloudflareAccountId');
+        cfApiToken = localStore.get('cloudflareApiKey');
+      } catch (e) {}
+
+      if (!cfAccountId || !cfApiToken) {
+        throw new Error('Cloudflare credentials are not configured. Add the account ID and API token in Settings.');
+      }
+
+      // Filter payload for Cloudflare /ai/run/ endpoint
+      const { model, ...restPayload } = payload;
+      
+      const url = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/ai/run/@cf/qwen/qwen3-30b-a3b-fp8`;
+      
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s timeout
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${cfApiToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(restPayload),
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Cloudflare HTTP Error: ${response.status} - ${errorText}`);
+      }
+
+      const cfData = await response.json();
+      
+      if (!cfData.success) {
+        throw new Error(`Cloudflare AI Error: ${JSON.stringify(cfData.errors)}`);
+      }
+
+      console.log(`[ModelGateway] Cloudflare request succeeded!`);
+      
+      // Map Cloudflare's response to OpenAI format so the rest of the app works
+      let textContent = '';
+      let toolCalls = null;
+      
+      if (cfData.result && cfData.result.response) {
+        textContent = cfData.result.response;
+      }
+      
+      // If the model output a tool call natively in the CF result format
+      if (cfData.result && cfData.result.tool_calls) {
+        toolCalls = cfData.result.tool_calls;
+      }
+
+      const data = {
+        choices: [
+          {
+            message: {
+              content: textContent,
+              ...(toolCalls ? { tool_calls: toolCalls } : {})
+            }
+          }
+        ],
+        usage: { total_tokens: 0 }
+      };
+
+      const tokens = 0;
+      return { data, tokensUsed: tokens };
+
+    } catch (cfError) {
+      console.error(`[ModelGateway] Cloudflare failed: ${cfError.message}.`);
+      
+      const key = await this.getApiKey();
+      if (!key || key === 'YOUR_GROQ_API_KEY') {
+        throw new Error(`Cloudflare Request Failed: ${cfError.message}`);
+      }
+      
+      console.log('Falling back to Groq...');
+      let groqModel = payload.model;
+      if (groqModel === 'qwen3-30b-a3b-fp8' || groqModel === 'qwen3:8b-q4_K_M' || !this.availableModels || !this.availableModels.includes(groqModel)) {
+        groqModel = await this.resolveModel(isReasoning ? this.reasoningModel : this.defaultModel, isReasoning);
+      }
+      
+      const groqPayload = {
+        ...payload,
+        model: groqModel
+      };
+
+      return await this._fetchGroq(groqPayload);
+    }
+  }
+
   async _ensureModels() {
     if (!this.isAvailable()) return;
     if (this.availableModels) return;
@@ -90,7 +199,7 @@ class ModelGateway {
     
     this.fetchingModels = (async () => {
       try {
-        const key = this.getApiKey();
+        const key = await this.getApiKey();
         const response = await fetch(this.modelsUrl, {
           headers: { 'Authorization': `Bearer ${key}` }
         });
@@ -109,9 +218,20 @@ class ModelGateway {
 
   async resolveModel(requestedModel, isReasoning = false) {
     await this._ensureModels();
+    console.log('[ModelGateway] Available models in resolveModel:', this.availableModels);
     if (!this.availableModels || this.availableModels.length === 0) return requestedModel;
     
     if (this.availableModels.includes(requestedModel)) return requestedModel;
+
+    // Sandbox proxy mappings to avoid picking low-context models
+    if (requestedModel.includes('8b') || requestedModel.includes('instant')) {
+      if (this.availableModels.includes('llama-3.1-8b-instant')) return 'llama-3.1-8b-instant';
+      if (this.availableModels.includes('llama3-8b-8192')) return 'llama3-8b-8192';
+    }
+    if (requestedModel.includes('70b') || requestedModel.includes('versatile')) {
+      if (this.availableModels.includes('llama-3.1-70b-versatile')) return 'llama-3.1-70b-versatile';
+      if (this.availableModels.includes('llama3-70b-8192')) return 'llama3-70b-8192';
+    }
     
     // Filter out audio/vision/guard models
     const textModels = this.availableModels.filter(m => 
@@ -122,7 +242,7 @@ class ModelGateway {
 
     // For reasoning tasks, try to find a large model
     if (isReasoning) {
-       const large = textModels.find(m => m.includes('8b') || m.includes('mini'));
+       const large = textModels.find(m => m.includes('70b') || m.includes('120b') || m.includes('90b') || m.includes('27b'));
        if (large) return large;
     } else {
        // For standard chat tasks, try to find a fast model
@@ -138,19 +258,16 @@ class ModelGateway {
    * Simple chat completion.
    */
   async chat(messages, options = {}) {
-    let model = options.model || this.defaultModel;
-    if (model.includes('gemini')) model = this.defaultModel;
-    model = await this.resolveModel(model, false);
     const sysMsg = options.systemInstruction ? [{ role: 'system', content: options.systemInstruction }] : [];
     
     const payload = {
-      model,
+      model: options.model || 'qwen3-30b-a3b-fp8',
       messages: [...sysMsg, ...messages],
       temperature: options.temperature ?? 0.7,
       max_tokens: options.maxTokens ?? 1024,
     };
 
-    const { data, tokensUsed } = await this._fetchGroq(payload);
+    const { data, tokensUsed } = await this._fetchWithFallback(payload, false);
     return { text: data.choices[0]?.message?.content || '', tokensUsed };
   }
 
@@ -158,9 +275,6 @@ class ModelGateway {
    * Chat with function calling / tool use.
    */
   async toolCall(messages, tools, options = {}) {
-    let model = options.model || this.reasoningModel;
-    if (model.includes('gemini')) model = this.reasoningModel;
-    model = await this.resolveModel(model, true);
     const sysMsg = options.systemInstruction ? [{ role: 'system', content: options.systemInstruction }] : [];
 
     const groqTools = tools.map(t => ({
@@ -173,14 +287,14 @@ class ModelGateway {
     }));
 
     const payload = {
-      model,
+      model: options.model || 'qwen3-30b-a3b-fp8',
       messages: [...sysMsg, ...messages],
       tools: groqTools,
       tool_choice: 'auto',
       temperature: options.temperature ?? 0.3,
     };
 
-    const { data, tokensUsed } = await this._fetchGroq(payload);
+    const { data, tokensUsed } = await this._fetchWithFallback(payload, true);
     const message = data.choices[0]?.message;
 
     if (message?.tool_calls?.length > 0) {
@@ -201,10 +315,6 @@ class ModelGateway {
    * Get structured JSON output.
    */
   async structuredOutput(prompt, schema, options = {}) {
-    let model = options.model || this.reasoningModel;
-    if (model.includes('gemini')) model = this.reasoningModel;
-    model = await this.resolveModel(model, true);
-    
     // Groq requires JSON output instruction in the prompt
     const sysMsg = [{ 
       role: 'system', 
@@ -212,20 +322,36 @@ class ModelGateway {
     }];
 
     const payload = {
-      model,
+      model: options.model || 'qwen3-30b-a3b-fp8',
       messages: [...sysMsg, { role: 'user', content: prompt }],
       response_format: { type: 'json_object' },
       temperature: options.temperature ?? 0.1,
     };
 
-    const { data, tokensUsed } = await this._fetchGroq(payload);
+    const { data, tokensUsed } = await this._fetchWithFallback(payload, true);
     const text = data.choices[0]?.message?.content || '{}';
-    
     let parsedData;
-    try {
-      parsedData = JSON.parse(text);
-    } catch {
-      parsedData = { raw: text };
+    
+    if (typeof text !== 'string') {
+      // Cloudflare sometimes auto-parses JSON responses natively.
+      parsedData = text;
+    } else {
+      let cleanedText = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+      try {
+        parsedData = JSON.parse(cleanedText);
+      } catch {
+        // Fallback: try to extract JSON block if there's conversational text mixed in
+        const match = cleanedText.match(/\{[\s\S]*\}/);
+        if (match) {
+          try {
+            parsedData = JSON.parse(match[0]);
+          } catch {
+            parsedData = { raw: text };
+          }
+        } else {
+          parsedData = { raw: text };
+        }
+      }
     }
 
     return { data: parsedData, tokensUsed };

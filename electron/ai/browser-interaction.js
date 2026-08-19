@@ -2,6 +2,20 @@
  * Actra AI - Browser Interaction Engine
  * Handles virtual cursor, screen understanding, and UI automation.
  */
+
+/**
+ * CoordinateTransformer
+ * Centralizes the mathematical translation between UI-TARS screenshot pixels,
+ * physical display pixels, and internal Chromium CSS Viewport coordinates.
+ */
+class CoordinateTransformer {
+  static toCSSViewport(x, y, devicePixelRatio = 1) { // Assuming global devicePixelRatio logic inside electron or passing explicitly
+    return {
+      cssX: Math.round(x / devicePixelRatio),
+      cssY: Math.round(y / devicePixelRatio)
+    };
+  }
+}
 class BrowserInteractionEngine {
   constructor(tabManager) {
     this.tabManager = tabManager;
@@ -305,6 +319,78 @@ class BrowserInteractionEngine {
     `;
     return await view.webContents.executeJavaScript(scrollScript);
   }
+
+
+
+  /**
+   * DOM + UI-TARS Hybrid Grounding:
+   * Reconciles raw visual coordinates back into a reliable semantic DOM element if possible.
+   */
+  async reconcileCoordinatesToDOM(tabId, x, y) {
+    const view = this._getView(tabId);
+    
+    const elementId = await view.webContents.executeJavaScript(`
+      (() => {
+        const cssX = Math.round(${x} / window.devicePixelRatio);
+        const cssY = Math.round(${y} / window.devicePixelRatio);
+
+        let el = document.elementFromPoint(cssX, cssY);
+        for (let i = 0; i < 3 && el && el !== document.body; i++) {
+          if (el.hasAttribute('data-actra-id')) return el.getAttribute('data-actra-id');
+          el = el.parentElement;
+        }
+        return null;
+      })();
+    `);
+    
+    return elementId;
+  }
+
+  /**
+   * Coordinate-based Click (For UI-TARS VLM)
+   */
+  async clickAt(tabId, x, y) {
+    const view = this._getView(tabId);
+    await view.webContents.executeJavaScript(`
+      (() => {
+        const cssX = Math.round(${x} / window.devicePixelRatio);
+        const cssY = Math.round(${y} / window.devicePixelRatio);
+        const el = document.elementFromPoint(cssX, cssY);
+        if (el) {
+          el.focus();
+          el.click();
+          el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+          el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+        }
+      })();
+    `);
+    return `Coordinate click at [${x}, ${y}]`;
+  }
+
+  /**
+   * Coordinate-based Type (For UI-TARS VLM)
+   */
+  async typeAt(tabId, x, y, text) {
+    const view = this._getView(tabId);
+    
+    // First click to focus
+    await this.clickAt(tabId, x, y);
+    
+    await view.webContents.executeJavaScript(`
+      (() => {
+        const cssX = Math.round(${x} / window.devicePixelRatio);
+        const cssY = Math.round(${y} / window.devicePixelRatio);
+        const el = document.elementFromPoint(cssX, cssY);
+        if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) {
+          el.value = ${JSON.stringify(text)};
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      })();
+    `);
+    return `Typed "${text}" at [${x}, ${y}]`;
+  }
 }
 
-module.exports = BrowserInteractionEngine;
+// Export the engine and transformer for potential unit testing
+module.exports = { BrowserInteractionEngine, CoordinateTransformer };

@@ -6,20 +6,13 @@
  * data_sources_used, actions_proposed, approval_required, approval_status,
  * approved_by, execution_status, execution_result, error.
  */
-const { default: Store } = require('electron-store');
+const supabase = require('../supabase');
 
 class AuditLog {
-  constructor() {
-    this.store = new Store({ name: 'ai-audit-log' });
-  }
-
-  /**
-   * Create a new audit entry for a workflow run.
-   * Call this at the start of a workflow, then update with updateEntry().
-   */
-  createEntry(workflowId, userRequest) {
+  async createEntry(workflowId, userRequest) {
+    const id = 'log_' + Date.now() + Math.random().toString(36).substr(2, 6);
     const entry = {
-      id: 'log_' + Date.now() + Math.random().toString(36).substr(2, 6),
+      id,
       workflow_id: workflowId,
       user_request: userRequest,
       timestamp: Date.now(),
@@ -34,35 +27,22 @@ class AuditLog {
       error: null,
     };
 
-    const logs = this.store.get('logs', []);
-    logs.unshift(entry);
-    if (logs.length > 1000) logs.length = 1000;
-    this.store.set('logs', logs);
-
-    return entry.id;
+    await supabase.from('audit_logs').insert([{ id, log_data: entry }]);
+    return id;
   }
 
-  /**
-   * Update fields on an existing audit entry.
-   * @param {string} entryId - The ID returned by createEntry
-   * @param {Partial<AuditEntry>} updates
-   */
-  updateEntry(entryId, updates) {
-    const logs = this.store.get('logs', []);
-    const idx = logs.findIndex(l => l.id === entryId);
-    if (idx === -1) return;
-
-    Object.assign(logs[idx], updates);
-    this.store.set('logs', logs);
+  async updateEntry(entryId, updates) {
+    const { data } = await supabase.from('audit_logs').select('log_data').eq('id', entryId).single();
+    if (!data) return;
+    
+    const updated = { ...data.log_data, ...updates };
+    await supabase.from('audit_logs').update({ log_data: updated }).eq('id', entryId);
   }
 
-  /**
-   * Convenience: log a completed action (legacy single-shot API).
-   */
-  logAction(action, context, result) {
-    const logs = this.store.get('logs', []);
-    logs.unshift({
-      id: 'log_' + Date.now(),
+  async logAction(action, context, result) {
+    const id = 'log_' + Date.now();
+    const entry = {
+      id,
       workflow_id: context?.taskId || 'unknown',
       user_request: context?.goal || action.name,
       timestamp: Date.now(),
@@ -75,17 +55,17 @@ class AuditLog {
       execution_status: result?.success !== false ? 'success' : 'failed',
       execution_result: typeof result === 'string' ? result : JSON.stringify(result),
       error: result?.error || null,
-    });
-    if (logs.length > 1000) logs.length = 1000;
-    this.store.set('logs', logs);
+    };
+    await supabase.from('audit_logs').insert([{ id, log_data: entry }]);
   }
 
-  getLogs(limit = 100) {
-    return this.store.get('logs', []).slice(0, limit);
+  async getLogs(limit = 100) {
+    const { data } = await supabase.from('audit_logs').select('log_data').limit(limit).order('id', { ascending: false });
+    return data ? data.map(d => d.log_data) : [];
   }
 
-  clearLogs() {
-    this.store.set('logs', []);
+  async clearLogs() {
+    await supabase.from('audit_logs').delete().neq('id', '0');
   }
 }
 

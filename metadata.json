@@ -1,6 +1,0 @@
-{
-  "name": "Actra Browser",
-  "description": "A minimalist macOS desktop web browser built with Electron, featuring tab management, history, bookmarks, downloads, and a warm beige and orange aesthetic.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

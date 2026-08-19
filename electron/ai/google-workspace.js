@@ -19,9 +19,9 @@ class GoogleWorkspaceEngine {
     this.calendar = google.calendar({ version: 'v3' });
   }
 
-  _requireAuth() {
-    const auth = googleAuth.getClient();
-    if (!googleAuth.isAuthenticated()) {
+  async _requireAuth() {
+    const auth = await googleAuth.getClient();
+    if (!(await googleAuth.isAuthenticated())) {
       throw new Error('Google Workspace authentication required. Please sign in via the AI Side Panel.');
     }
     return auth;
@@ -35,7 +35,7 @@ class GoogleWorkspaceEngine {
    * @param {number} maxResults
    */
   async searchGmail(query, maxResults = 10) {
-    const auth = this._requireAuth();
+    const auth = await this._requireAuth();
     const res = await this.gmail.users.messages.list({
       auth,
       userId: 'me',
@@ -78,7 +78,7 @@ class GoogleWorkspaceEngine {
    * @param {string} threadId
    */
   async readGmailThread(threadId) {
-    const auth = this._requireAuth();
+    const auth = await this._requireAuth();
     const res = await this.gmail.users.threads.get({
       auth,
       userId: 'me',
@@ -124,7 +124,7 @@ class GoogleWorkspaceEngine {
    * Send an email via Gmail API.
    */
   async sendEmail(to, subject, body) {
-    const auth = this._requireAuth();
+    const auth = await this._requireAuth();
 
     const message = [
       `To: ${to}`,
@@ -159,7 +159,7 @@ class GoogleWorkspaceEngine {
    * @param {number} maxResults
    */
   async getCalendarEvents(timeMin, timeMax, maxResults = 20) {
-    const auth = this._requireAuth();
+    const auth = await this._requireAuth();
     const res = await this.calendar.events.list({
       auth,
       calendarId: 'primary',
@@ -185,7 +185,7 @@ class GoogleWorkspaceEngine {
    * Create a calendar event.
    */
   async createCalendarEvent(title, startDateTime, endDateTime, attendeeEmails = [], description = '') {
-    const auth = this._requireAuth();
+    const auth = await this._requireAuth();
     const res = await this.calendar.events.insert({
       auth,
       calendarId: 'primary',
@@ -206,7 +206,7 @@ class GoogleWorkspaceEngine {
    * Read rows from a Google Sheet.
    */
   async readSheet(spreadsheetId, range) {
-    const auth = this._requireAuth();
+    const auth = await this._requireAuth();
     const res = await this.sheets.spreadsheets.values.get({
       auth,
       spreadsheetId,
@@ -219,7 +219,7 @@ class GoogleWorkspaceEngine {
    * Append rows to a Google Sheet.
    */
   async writeSheet(spreadsheetId, range, values) {
-    const auth = this._requireAuth();
+    const auth = await this._requireAuth();
     const res = await this.sheets.spreadsheets.values.append({
       auth,
       spreadsheetId,
@@ -234,7 +234,7 @@ class GoogleWorkspaceEngine {
    * Update a specific range in a Google Sheet.
    */
   async updateSheet(spreadsheetId, range, values) {
-    const auth = this._requireAuth();
+    const auth = await this._requireAuth();
     const res = await this.sheets.spreadsheets.values.update({
       auth,
       spreadsheetId,
@@ -251,7 +251,7 @@ class GoogleWorkspaceEngine {
    * Search Drive for files matching a query.
    */
   async searchDrive(query, maxResults = 10, mimeType = null) {
-    const auth = this._requireAuth();
+    const auth = await this._requireAuth();
     let q = "trashed = false";
     if (query) {
       q += ` and fullText contains '${query.replace(/'/g, "\\'")}'`;
@@ -278,7 +278,7 @@ class GoogleWorkspaceEngine {
    * Create a new Google Doc.
    */
   async createDoc(title, content) {
-    const auth = this._requireAuth();
+    const auth = await this._requireAuth();
     const docs = google.docs({ version: 'v1', auth });
 
     const createRes = await docs.documents.create({

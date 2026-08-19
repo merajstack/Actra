@@ -18,6 +18,14 @@ class ApprovalEngine {
     this.pendingApprovals = new Map();
   }
 
+  getPendingApprovals() {
+    const list = [];
+    for (const [id, value] of this.pendingApprovals.entries()) {
+      list.push(this._buildApprovalPayload(id, value.action, value.context, value.riskLevel));
+    }
+    return list;
+  }
+
   /**
    * Evaluate whether an action requires approval.
    * Returns { approved: bool, riskLevel: number, reason?: string }
@@ -41,6 +49,8 @@ class ApprovalEngine {
       return await this._requestHumanApproval(action, context, riskLevel);
     }
 
+    return { approved: true, riskLevel: 0 };
+
     // allow
     return { approved: true, riskLevel };
   }
@@ -50,24 +60,27 @@ class ApprovalEngine {
    * The returned promise only resolves when the user explicitly acts.
    */
   _requestHumanApproval(action, context, riskLevel) {
-    return new Promise((resolve) => {
-      const approvalId = 'app_' + Date.now() + Math.random().toString(36).substr(2, 9);
+    return new Promise((resolve, reject) => {
+      try {
+        const approvalId = 'app_' + Date.now() + Math.random().toString(36).substr(2, 9);
 
-      this.pendingApprovals.set(approvalId, {
-        action,
-        context,
-        riskLevel,
-        resolve: (result) => resolve({ ...result, approvalId, riskLevel }),
-      });
+        this.pendingApprovals.set(approvalId, {
+          action,
+          context,
+          riskLevel,
+          resolve: (result) => resolve({ ...result, approvalId, riskLevel }),
+        });
 
-      if (global.mainWindow && !global.mainWindow.isDestroyed()) {
-        // Build rich approval payload for the UI
-        const payload = this._buildApprovalPayload(approvalId, action, context, riskLevel);
-        global.mainWindow.webContents.send('ai:require-approval', payload);
-        global.mainWindow.webContents.send('ai:open-side-panel');
+        if (global.mainWindow && !global.mainWindow.isDestroyed()) {
+          // Build rich approval payload for the UI
+          const payload = this._buildApprovalPayload(approvalId, action, context, riskLevel);
+          global.mainWindow.webContents.send('ai:require-approval', payload);
+          global.mainWindow.webContents.send('ai:open-side-panel');
+        }
+      } catch (err) {
+        console.error('[ApprovalEngine] Error in _requestHumanApproval:', err);
+        reject(err);
       }
-
-      // NOTE: No auto-approve timeout — user MUST respond explicitly.
     });
   }
 
@@ -137,6 +150,16 @@ class ApprovalEngine {
     pending.resolve({ approved: true, editedArgs: newArgs, action: updatedAction });
     this.pendingApprovals.delete(approvalId);
     return true;
+  }
+
+  rejectAll(reason = 'Cancelled by user') {
+    const rejected = [];
+    for (const [approvalId, pending] of this.pendingApprovals.entries()) {
+      pending.resolve({ approved: false, reason });
+      rejected.push(approvalId);
+      this.pendingApprovals.delete(approvalId);
+    }
+    return rejected;
   }
 
   hasPending(approvalId) {

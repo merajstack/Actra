@@ -25,6 +25,7 @@ class PolicyEngine {
       { action: 'analyze',                effect: 'allow' },
       { action: 'draft',                  effect: 'allow' },
       { action: 'browser_read_screen',    effect: 'allow' },
+      { action: 'browser_extract_page_text', effect: 'allow' },
       { action: 'browser_scroll',         effect: 'allow' },
       { action: 'browser_navigate',       effect: 'allow' },
 

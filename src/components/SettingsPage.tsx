@@ -1,11 +1,36 @@
-import React from 'react';
-import { ArrowLeft, Settings, Search, Lock, Shield, Monitor, Globe, HardDrive } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { ArrowLeft, Settings, Search, Lock, Shield, Monitor, Globe, HardDrive, KeyRound, Save } from 'lucide-react';
+import { AIProviderSettings } from '../types';
 
 interface SettingsPageProps {
   onBackToBrowser: () => void;
 }
 
 export const SettingsPage: React.FC<SettingsPageProps> = ({ onBackToBrowser }) => {
+  const [providerSettings, setProviderSettings] = useState<AIProviderSettings>({ cloudflareAccountId: '', cloudflareApiKey: '', groqKey: '' });
+  const [saveState, setSaveState] = useState('');
+
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (api?.getKeys) {
+      api.getKeys().then((keys: AIProviderSettings) => setProviderSettings({ ...providerSettings, ...keys }));
+    } else {
+      const saved = localStorage.getItem('actra-provider-settings');
+      if (saved) setProviderSettings(JSON.parse(saved));
+    }
+  }, []);
+
+  const saveProviderSettings = async () => {
+    const api = (window as any).electronAPI;
+    if (api?.saveKeys) {
+      await api.saveKeys(providerSettings);
+    } else {
+      localStorage.setItem('actra-provider-settings', JSON.stringify(providerSettings));
+    }
+    setSaveState('Saved locally');
+    setTimeout(() => setSaveState(''), 2500);
+  };
+
   return (
     <div className="flex-1 bg-[#FDFBF7] flex flex-col overflow-y-auto select-none">
       {/* Header */}
@@ -26,6 +51,35 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onBackToBrowser }) =
       </div>
 
       <div className="max-w-3xl w-full mx-auto p-8 space-y-6">
+        {/* AI provider credentials */}
+        <div className="bg-white p-6 rounded-2xl border border-[#EBE5D8] shadow-sm space-y-4">
+          <div className="flex items-center space-x-3 border-b border-zinc-100 pb-3">
+            <KeyRound className="w-5 h-5 text-orange-500" />
+            <div>
+              <h3 className="text-sm font-bold text-zinc-800 font-serif">AI Provider Credentials</h3>
+              <p className="text-[11px] text-zinc-400">Stored on this device and used by Actra AI.</p>
+            </div>
+          </div>
+          <label className="block space-y-1">
+            <span className="text-xs font-semibold text-zinc-800">Cloudflare Account ID</span>
+            <input value={providerSettings.cloudflareAccountId} onChange={e => setProviderSettings(prev => ({ ...prev, cloudflareAccountId: e.target.value }))} className="w-full px-3 py-2 rounded-xl border border-[#E2DAD0] bg-[#FDFBF7] text-xs font-mono outline-none focus:border-orange-400" />
+          </label>
+          <label className="block space-y-1">
+            <span className="text-xs font-semibold text-zinc-800">Cloudflare API Token</span>
+            <input type="password" value={providerSettings.cloudflareApiKey} onChange={e => setProviderSettings(prev => ({ ...prev, cloudflareApiKey: e.target.value }))} className="w-full px-3 py-2 rounded-xl border border-[#E2DAD0] bg-[#FDFBF7] text-xs font-mono outline-none focus:border-orange-400" />
+          </label>
+          <label className="block space-y-1">
+            <span className="text-xs font-semibold text-zinc-800">Groq API Key (fallback)</span>
+            <input type="password" value={providerSettings.groqKey} onChange={e => setProviderSettings(prev => ({ ...prev, groqKey: e.target.value }))} className="w-full px-3 py-2 rounded-xl border border-[#E2DAD0] bg-[#FDFBF7] text-xs font-mono outline-none focus:border-orange-400" />
+          </label>
+          <div className="flex items-center justify-end gap-3">
+            {saveState && <span className="text-xs text-emerald-600">{saveState}</span>}
+            <button onClick={saveProviderSettings} className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-orange-500 hover:bg-orange-600 text-white text-xs font-semibold transition-colors">
+              <Save className="w-3.5 h-3.5" /> Save credentials
+            </button>
+          </div>
+        </div>
+
         {/* Search Engine */}
         <div className="bg-white p-6 rounded-2xl border border-[#EBE5D8] shadow-sm space-y-4">
           <div className="flex items-center space-x-3 border-b border-zinc-100 pb-3">

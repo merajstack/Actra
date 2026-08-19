@@ -1,6 +1,6 @@
 import React from 'react';
 import { DownloadItem } from '../types';
-import { Download, Trash2, ArrowLeft, FolderOpen, CheckCircle, Clock } from 'lucide-react';
+import { Download, Trash2, ArrowLeft, FolderOpen, CheckCircle, Image as ImageIcon } from 'lucide-react';
 
 interface DownloadsPageProps {
   downloads: DownloadItem[];
@@ -13,6 +13,15 @@ export const DownloadsPage: React.FC<DownloadsPageProps> = ({
   onClearDownloads,
   onBackToBrowser,
 }) => {
+  const isImageDownload = (item: DownloadItem) =>
+    item.mimeType?.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i.test(item.filename);
+
+  const toFileUrl = (path?: string) => {
+    if (!path) return undefined;
+    if (/^(file|https?):\/\//i.test(path)) return path;
+    return `file://${path.split('/').map(encodeURIComponent).join('/')}`;
+  };
+
   return (
     <div className="flex-1 bg-[#FDFBF7] flex flex-col overflow-y-auto select-none">
       {/* Header */}
@@ -56,8 +65,14 @@ export const DownloadsPage: React.FC<DownloadsPageProps> = ({
               className="flex items-center justify-between p-4 rounded-2xl bg-white border border-[#EBE5D8] hover:border-orange-300 hover:shadow-md transition-all group"
             >
               <div className="flex items-center space-x-4 flex-1 truncate mr-4">
-                <div className="w-10 h-10 rounded-xl bg-orange-100 text-orange-600 flex items-center justify-center shrink-0">
-                  <Download className="w-5 h-5" />
+                <div className="w-12 h-12 rounded-xl bg-orange-100 text-orange-600 flex items-center justify-center shrink-0 overflow-hidden">
+                  {isImageDownload(item) && item.localPath ? (
+                    <img src={toFileUrl(item.localPath)} alt="" className="w-full h-full object-cover" />
+                  ) : isImageDownload(item) ? (
+                    <ImageIcon className="w-5 h-5" />
+                  ) : (
+                    <Download className="w-5 h-5" />
+                  )}
                 </div>
                 <div className="truncate flex-1">
                   <div className="text-xs font-bold text-zinc-800 truncate">{item.filename}</div>

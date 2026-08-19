@@ -1,26 +1,27 @@
 /**
  * Actra Browser - Bookmark Store using electron-store
  */
-const { default: Store } = require('electron-store');
-const store = new Store();
+const supabase = require('./supabase');
 
 class BookmarkStore {
-  static getBookmarks() {
-    return store.get('browser_bookmarks', [
-      { id: 'b1', title: 'GitHub', url: 'https://github.com', folderId: '1', dateAdded: Date.now() },
-      { id: 'b2', title: 'Hacker News', url: 'https://news.ycombinator.com', folderId: '1', dateAdded: Date.now() }
-    ]);
+  static async getBookmarks() {
+    const { data, error } = await supabase.from('bookmarks').select('*').order('date_added', { ascending: true });
+    if (error) {
+      console.error('Error fetching bookmarks:', error);
+      return [];
+    }
+    return data || [];
   }
 
-  static addBookmark(bookmark) {
-    const bookmarks = this.getBookmarks();
-    bookmarks.push({ id: `b-${Date.now()}`, ...bookmark, dateAdded: Date.now() });
-    store.set('browser_bookmarks', bookmarks);
+  static async addBookmark(bookmark) {
+    const newBookmark = { id: `b-${Date.now()}`, ...bookmark, date_added: Date.now() };
+    const { error } = await supabase.from('bookmarks').insert([newBookmark]);
+    if (error) console.error('Error adding bookmark:', error);
   }
 
-  static removeBookmark(id) {
-    const bookmarks = this.getBookmarks().filter(b => b.id !== id);
-    store.set('browser_bookmarks', bookmarks);
+  static async removeBookmark(id) {
+    const { error } = await supabase.from('bookmarks').delete().eq('id', id);
+    if (error) console.error('Error removing bookmark:', error);
   }
 }
 
