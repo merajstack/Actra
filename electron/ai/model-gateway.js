@@ -167,6 +167,21 @@ class ModelGateway {
     if (Array.isArray(payload.messages)) {
       const messages = payload.messages.map((message) => {
         if (typeof message.content !== 'string') return message;
+        
+        // Extract base64 image if present to support vision models
+        const imageMatch = message.content.match(/(data:image\/[^;]+;base64,[A-Za-z0-9+/=]+)/);
+        if (imageMatch) {
+          const base64Str = imageMatch[1];
+          const textWithoutImage = message.content.replace(base64Str, '').trim();
+          return {
+            ...message,
+            content: [
+              { type: 'text', text: textWithoutImage || 'Please analyze this image.' },
+              { type: 'image_url', image_url: { url: base64Str } }
+            ]
+          };
+        }
+
         const limit = message.role === 'system' ? 8000 : 3500;
         if (message.content.length <= limit) return message;
         return {
@@ -178,7 +193,20 @@ class ModelGateway {
       // Keep the system prompt and the most recent context. Old assistant/tool
       // output is the usual source of oversized requests.
       let selected = messages;
-      while (JSON.stringify({ ...compact, messages: selected }).length > 32000 && selected.length > 2) {
+      
+      const getPayloadSize = (msgs) => {
+        const clone = JSON.parse(JSON.stringify(msgs));
+        clone.forEach(m => {
+          if (Array.isArray(m.content)) {
+            m.content.forEach(c => {
+              if (c.type === 'image_url') c.image_url.url = '';
+            });
+          }
+        });
+        return JSON.stringify({ ...compact, messages: clone }).length;
+      };
+
+      while (getPayloadSize(selected) > 32000 && selected.length > 2) {
         const firstNonSystem = selected.findIndex(message => message.role !== 'system');
         if (firstNonSystem < 0) break;
         selected = selected.slice(0, firstNonSystem).concat(selected.slice(firstNonSystem + 1));
@@ -219,10 +247,8 @@ class ModelGateway {
         throw createCloudflareUserError(CLOUDFLARE_INVALID_ACCOUNT_MESSAGE, 'CLOUDFLARE_INVALID_ACCOUNT');
       }
 
-      // Filter payload for Cloudflare /ai/run/ endpoint
-      const { model, ...restPayload } = payload;
-      
-      const url = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/ai/run/@cf/openai/gpt-oss-120b`;
+      // Use OpenAI-compatible endpoint for better tool calling support
+      const url = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/ai/v1/chat/completions`;
       
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s timeout
@@ -233,7 +259,7 @@ class ModelGateway {
           'Authorization': `Bearer ${cfApiToken}`,
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify(restPayload),
+        body: JSON.stringify(payload),
         signal: controller.signal
       });
 
