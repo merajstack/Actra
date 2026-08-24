@@ -1,10 +1,11 @@
 import { cn } from "../../lib/utils";
 import React, { useState, useRef, useEffect, forwardRef, useImperativeHandle, useMemo, useCallback, createContext } from "react";
 import { cva, type VariantProps } from "class-variance-authority";
-import { ArrowRight, Key, Globe, Shield, ArrowLeft, X, AlertCircle, PartyPopper, Loader, Brain } from "lucide-react";
+import { ArrowRight, Key, Globe, Shield, ArrowLeft, X, AlertCircle, PartyPopper } from "lucide-react";
 import { AnimatePresence, motion, useInView, Variants, Transition } from "framer-motion";
 import confetti from "canvas-confetti";
 import { Button } from "./button";
+import { ActraLoader } from "../ActraLoader";
 
 // --- CONFETTI LOGIC ---
 type Api = { fire: (options?: confetti.Options) => void }
@@ -232,10 +233,10 @@ const GoogleIcon = () => (
 );
 
 const modalSteps = [
-  { message: "Securing keys...", icon: <Loader className="w-12 h-12 text-primary animate-spin" /> },
-  { message: "Onboarding...", icon: <Loader className="w-12 h-12 text-primary animate-spin" /> },
-  { message: "Finishing up...", icon: <Loader className="w-12 h-12 text-primary animate-spin" /> },
-  { message: "Welcome to Actra!", icon: <PartyPopper className="w-12 h-12 text-green-500" /> }
+  { message: "Securing keys...", icon: <ActraLoader size="lg" label="Securing keys" /> },
+  { message: "Onboarding...", icon: <ActraLoader size="lg" label="Onboarding" /> },
+  { message: "Finishing up...", icon: <ActraLoader size="lg" label="Finishing up" /> },
+  { message: "Welcome to Actra!", icon: <img src="./app.png" alt="Actra" className="w-12 h-12 object-contain" /> }
 ];
 
 const TEXT_LOOP_INTERVAL = 1.2;
@@ -487,7 +488,7 @@ export function OnboardingStepper({ onComplete, onGoogleSignIn, userProfile }: O
       <div className="relative z-10 w-full max-w-md bg-white/70 backdrop-blur-md rounded-3xl border border-zinc-200/50 p-8 shadow-2xl space-y-8 flex flex-col">
         <div className="text-center space-y-2">
           <div className="mx-auto w-12 h-12 bg-orange-100 text-orange-600 rounded-full flex items-center justify-center mb-2 shadow-inner">
-            <Brain className="w-6 h-6" />
+            <img src="./app.png" alt="Actra" className="w-6 h-6 object-contain" />
           </div>
           <h2 className="text-2xl font-bold tracking-tight text-zinc-950 font-serif">Welcome to Actra</h2>
           <p className="text-xs text-zinc-500 uppercase tracking-widest font-semibold">Let's configure your workspace</p>
@@ -547,7 +548,7 @@ export function OnboardingStepper({ onComplete, onGoogleSignIn, userProfile }: O
                     >
                       {isSigningIn ? (
                         <span className="text-zinc-500 flex items-center gap-2">
-                          <Loader className="w-4 h-4 animate-spin" />
+                          <ActraLoader size="sm" label="Connecting" />
                           Connecting...
                         </span>
                       ) : (
@@ -569,7 +570,7 @@ export function OnboardingStepper({ onComplete, onGoogleSignIn, userProfile }: O
                     <Globe className="w-4 h-4 text-orange-500" /> Cloudflare Credentials <span className="text-xs text-orange-500 font-normal">(Important)</span>
                   </label>
                   <p className="text-xs text-zinc-500 leading-normal">
-                    This powers the local visual reasoning engine (Qwen3-30B). You can retrieve these from your Cloudflare dashboard.
+                    This powers the local visual reasoning engine (gpt-oss-120b). You can retrieve these from your Cloudflare dashboard.
                   </p>
                 </div>
                 

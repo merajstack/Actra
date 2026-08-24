@@ -14,6 +14,74 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../../.env') });
 const supabase = require('../supabase');
 
+const CLOUDFLARE_INVALID_ACCOUNT_MESSAGE = 'Invalid key/account id, please check and replace them in settings.';
+const ACTRA_AI_DAILY_LIMIT_MESSAGE = 'Actra AI daily limit finished, it resets at 00:00';
+const CLOUDFLARE_GENERIC_MESSAGE = 'Cloudflare request failed. Please try again later.';
+
+function createCloudflareUserError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  error.isCloudflareUserError = true;
+  return error;
+}
+
+function readCloudflareErrorText(body) {
+  if (!body) return '';
+  if (typeof body === 'string') {
+    try {
+      return readCloudflareErrorText(JSON.parse(body));
+    } catch {
+      return body;
+    }
+  }
+
+  const parts = [];
+  const collect = (value) => {
+    if (!value) return;
+    if (typeof value === 'string' || typeof value === 'number') {
+      parts.push(String(value));
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(collect);
+      return;
+    }
+    if (typeof value === 'object') {
+      collect(value.message);
+      collect(value.code);
+      collect(value.error);
+      collect(value.errors);
+      collect(value.detail);
+      collect(value.details);
+    }
+  };
+
+  collect(body);
+  return parts.join(' ');
+}
+
+function getCloudflareUserMessage(status, body) {
+  const text = readCloudflareErrorText(body).toLowerCase();
+
+  if (
+    status === 429 ||
+    /\b(rate[-\s]?limit|daily|quota|usage|capacity|too many|exceeded|limit reached|insufficient|not enough)\b/.test(text)
+  ) {
+    return { message: ACTRA_AI_DAILY_LIMIT_MESSAGE, code: 'ACTRA_AI_DAILY_LIMIT' };
+  }
+
+  if (
+    status === 401 ||
+    status === 403 ||
+    status === 404 ||
+    /\b(auth|authenticate|unauthorized|forbidden|permission|token|account|credential|invalid key|invalid token|invalid account|not found)\b/.test(text)
+  ) {
+    return { message: CLOUDFLARE_INVALID_ACCOUNT_MESSAGE, code: 'CLOUDFLARE_INVALID_ACCOUNT' };
+  }
+
+  return { message: CLOUDFLARE_GENERIC_MESSAGE, code: 'CLOUDFLARE_REQUEST_FAILED' };
+}
+
 class ModelGateway {
   constructor() {
     this.defaultModel = 'llama-3.1-8b-instant'; // fast default
@@ -31,7 +99,7 @@ class ModelGateway {
   async getApiKey() {
     try {
       const { default: Store } = await import('electron-store');
-      const localKey = new Store({ name: 'config' }).get('groqKey');
+      const localKey = new Store({ name: 'config', projectName: 'Actra' }).get('groqKey');
       if (localKey) return localKey;
     } catch (e) {}
     try {
@@ -42,7 +110,7 @@ class ModelGateway {
   }
 
   isAvailable() {
-    return true; // Cloudflare Qwen 30B is always available as first priority
+    return true; // Cloudflare gpt-oss-120b is always available as first priority
   }
 
   async _fetchGroq(payload) {
@@ -54,7 +122,8 @@ class ModelGateway {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 15000);
 
-    const payloadStr = JSON.stringify(payload);
+    const compactPayload = this._compactPayload(payload);
+    const payloadStr = JSON.stringify(compactPayload);
     console.log(`[ModelGateway] Sending payload. Size: ${payloadStr.length} chars. Model: ${payload.model}`);
 
     try {
@@ -72,6 +141,9 @@ class ModelGateway {
 
       if (!response.ok) {
         const errorText = await response.text();
+        if (response.status === 413) {
+          throw new Error('Groq rejected the request because the conversation or page context was too large. Actra shortened the context, but please start a new chat if this continues.');
+        }
         throw new Error(`Groq API Error: ${response.status} - ${errorText}`);
       }
 
@@ -90,28 +162,67 @@ class ModelGateway {
     }
   }
 
+  _compactPayload(payload) {
+    const compact = { ...payload };
+    if (Array.isArray(payload.messages)) {
+      const messages = payload.messages.map((message) => {
+        if (typeof message.content !== 'string') return message;
+        const limit = message.role === 'system' ? 8000 : 3500;
+        if (message.content.length <= limit) return message;
+        return {
+          ...message,
+          content: `${message.content.slice(0, Math.floor(limit * 0.65))}\n[context shortened by Actra]\n${message.content.slice(-Math.floor(limit * 0.35))}`,
+        };
+      });
+
+      // Keep the system prompt and the most recent context. Old assistant/tool
+      // output is the usual source of oversized requests.
+      let selected = messages;
+      while (JSON.stringify({ ...compact, messages: selected }).length > 32000 && selected.length > 2) {
+        const firstNonSystem = selected.findIndex(message => message.role !== 'system');
+        if (firstNonSystem < 0) break;
+        selected = selected.slice(0, firstNonSystem).concat(selected.slice(firstNonSystem + 1));
+      }
+      compact.messages = selected;
+    }
+
+    if (Array.isArray(payload.tools)) {
+      compact.tools = payload.tools.map(tool => ({
+        ...tool,
+        function: tool.function ? {
+          ...tool.function,
+          description: typeof tool.function.description === 'string'
+            ? tool.function.description.slice(0, 1200)
+            : tool.function.description,
+        } : tool.function,
+      }));
+    }
+    return compact;
+  }
+
   async _fetchWithFallback(payload, isReasoning = false) {
+    payload = this._compactPayload(payload);
     try {
-      console.log(`[ModelGateway] Attempting Cloudflare AI: qwen3-30b`);
+      console.log(`[ModelGateway] Attempting Cloudflare AI: gpt-oss-120b`);
       
       let cfAccountId;
       let cfApiToken;
 
       try {
         const { default: Store } = await import('electron-store');
-        const localStore = new Store({ name: 'config' });
+        const localStore = new Store({ name: 'config', projectName: 'Actra' });
         cfAccountId = localStore.get('cloudflareAccountId');
         cfApiToken = localStore.get('cloudflareApiKey');
       } catch (e) {}
 
       if (!cfAccountId || !cfApiToken) {
-        throw new Error('Cloudflare credentials are not configured. Add the account ID and API token in Settings.');
+        throw createCloudflareUserError(CLOUDFLARE_INVALID_ACCOUNT_MESSAGE, 'CLOUDFLARE_INVALID_ACCOUNT');
       }
 
       // Filter payload for Cloudflare /ai/run/ endpoint
       const { model, ...restPayload } = payload;
       
-      const url = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/ai/run/@cf/qwen/qwen3-30b-a3b-fp8`;
+      const url = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/ai/run/@cf/openai/gpt-oss-120b`;
       
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s timeout
@@ -130,27 +241,46 @@ class ModelGateway {
 
       if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(`Cloudflare HTTP Error: ${response.status} - ${errorText}`);
+        const { message, code } = getCloudflareUserMessage(response.status, errorText);
+        throw createCloudflareUserError(message, code);
       }
 
       const cfData = await response.json();
       
-      if (!cfData.success) {
-        throw new Error(`Cloudflare AI Error: ${JSON.stringify(cfData.errors)}`);
+      const isNativeOpenAI = cfData.choices !== undefined;
+      if (!isNativeOpenAI && !cfData.success) {
+        const { message, code } = getCloudflareUserMessage(response.status, cfData);
+        throw createCloudflareUserError(message, code);
       }
-
+      
       console.log(`[ModelGateway] Cloudflare request succeeded!`);
+      
+      if (isNativeOpenAI) {
+        // Mock cfData.result to use our new parser
+        cfData.result = cfData;
+      }
       
       // Map Cloudflare's response to OpenAI format so the rest of the app works
       let textContent = '';
       let toolCalls = null;
       
-      if (cfData.result && cfData.result.response) {
-        textContent = cfData.result.response;
+      console.log(`[ModelGateway] cfData.result:`, JSON.stringify(cfData.result).slice(0, 500));
+
+      if (cfData.result) {
+        if (typeof cfData.result === 'string') {
+          textContent = cfData.result;
+        } else if (cfData.result.response !== undefined) {
+          textContent = cfData.result.response;
+        } else if (cfData.result.choices && cfData.result.choices[0]?.message) {
+          textContent = cfData.result.choices[0].message.content || '';
+          if (cfData.result.choices[0].message.tool_calls) {
+            toolCalls = cfData.result.choices[0].message.tool_calls;
+          }
+        }
       }
       
       // If the model output a tool call natively in the CF result format
-      if (cfData.result && cfData.result.tool_calls) {
+      if (!toolCalls && cfData.result && cfData.result.tool_calls) {
         toolCalls = cfData.result.tool_calls;
       }
 
@@ -170,16 +300,24 @@ class ModelGateway {
       return { data, tokensUsed: tokens };
 
     } catch (cfError) {
-      console.error(`[ModelGateway] Cloudflare failed: ${cfError.message}.`);
+      if (cfError.name === 'AbortError') {
+        cfError = createCloudflareUserError('Cloudflare request timed out. Please try again.', 'CLOUDFLARE_TIMEOUT');
+      }
+
+      console.error(`[ModelGateway] Cloudflare failed: ${cfError.isCloudflareUserError ? cfError.message : CLOUDFLARE_GENERIC_MESSAGE}.`);
+
+      if (cfError.code === 'CLOUDFLARE_INVALID_ACCOUNT' || cfError.code === 'ACTRA_AI_DAILY_LIMIT') {
+        throw cfError;
+      }
       
       const key = await this.getApiKey();
       if (!key || key === 'YOUR_GROQ_API_KEY') {
-        throw new Error(`Cloudflare Request Failed: ${cfError.message}`);
+        throw cfError.isCloudflareUserError ? cfError : createCloudflareUserError(CLOUDFLARE_GENERIC_MESSAGE, 'CLOUDFLARE_REQUEST_FAILED');
       }
       
       console.log('Falling back to Groq...');
       let groqModel = payload.model;
-      if (groqModel === 'qwen3-30b-a3b-fp8' || groqModel === 'qwen3:8b-q4_K_M' || !this.availableModels || !this.availableModels.includes(groqModel)) {
+      if (groqModel === '@cf/openai/gpt-oss-120b' || !this.availableModels || !this.availableModels.includes(groqModel)) {
         groqModel = await this.resolveModel(isReasoning ? this.reasoningModel : this.defaultModel, isReasoning);
       }
       
@@ -251,7 +389,7 @@ class ModelGateway {
     }
     
     // Fallback to anything
-    return textModels.find(m => m.includes('llama')) || textModels.find(m => m.includes('qwen')) || textModels[0];
+    return textModels.find(m => m.includes('llama')) || textModels.find(m => m.includes('gpt-oss-120b')) || textModels[0];
   }
 
   /**
@@ -261,7 +399,7 @@ class ModelGateway {
     const sysMsg = options.systemInstruction ? [{ role: 'system', content: options.systemInstruction }] : [];
     
     const payload = {
-      model: options.model || 'qwen3-30b-a3b-fp8',
+      model: options.model || '@cf/openai/gpt-oss-120b',
       messages: [...sysMsg, ...messages],
       temperature: options.temperature ?? 0.7,
       max_tokens: options.maxTokens ?? 1024,
@@ -287,7 +425,7 @@ class ModelGateway {
     }));
 
     const payload = {
-      model: options.model || 'qwen3-30b-a3b-fp8',
+      model: options.model || '@cf/openai/gpt-oss-120b',
       messages: [...sysMsg, ...messages],
       tools: groqTools,
       tool_choice: 'auto',
@@ -322,7 +460,7 @@ class ModelGateway {
     }];
 
     const payload = {
-      model: options.model || 'qwen3-30b-a3b-fp8',
+      model: options.model || '@cf/openai/gpt-oss-120b',
       messages: [...sysMsg, { role: 'user', content: prompt }],
       response_format: { type: 'json_object' },
       temperature: options.temperature ?? 0.1,
