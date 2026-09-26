@@ -701,6 +701,9 @@ https://example.com
       let history = await chatManager.getHistory();
       if (history.length > 5) history = history.slice(-5); // cap to 5 messages to save tokens
       try {
+        if (modelGateway.isQuotaExhausted && modelGateway.isQuotaExhausted()) {
+          throw modelGateway.getLastQuotaError();
+        }
         if (!modelGateway.isAvailable()) {
           throw new Error('AI Model not available. Please configure your Cloudflare or Groq credentials in Settings (chrome://settings).');
         }
@@ -880,7 +883,10 @@ https://example.com
         } catch (error) {
           console.error('[BrowserAgent] workflow failed:', error);
           taskManager.updateTaskStatus(task.id, 'failed', { error: error.message });
-          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: `Error: ${error.message}` });
+          if (assistantMsg?.id) {
+            const prefix = (error?.isModelQuotaError || error?.code?.startsWith('QUOTA_')) ? '⚠️ ' : 'Error: ';
+            await chatManager.updateMessage(assistantMsg.id, { content: `${prefix}${error.message}` });
+          }
           auditLog.updateEntry(auditEntryId, { execution_status: 'failed', error: error.message });
         }
         return { success: true, taskId: task.id };
@@ -1218,7 +1224,8 @@ https://example.com
       console.error('[AI] Workflow failed:', err.message);
       taskManager.updateTaskStatus(task.id, 'failed', { error: err.message });
       if (assistantMsg?.id) {
-        await chatManager.updateMessage(assistantMsg.id, { content: `Error: ${err.message}` });
+        const prefix = (err?.isModelQuotaError || err?.code?.startsWith('QUOTA_')) ? '⚠️ ' : 'Error: ';
+        await chatManager.updateMessage(assistantMsg.id, { content: `${prefix}${err.message}` });
       }
       auditLog.updateEntry(auditEntryId, {
         execution_status: 'failed',
@@ -1324,6 +1331,9 @@ ipcMain.handle('app:save-keys', async (e, keys) => {
   const store = new Store({ name: 'config', projectName: 'Actra' });
   for (const key of ['cloudflareAccountId', 'cloudflareApiKey', 'groqKey']) {
     if (typeof keys?.[key] === 'string') store.set(key, keys[key].trim());
+  }
+  if (modelGateway?.clearQuotaError) {
+    modelGateway.clearQuotaError();
   }
   return { success: true };
 });

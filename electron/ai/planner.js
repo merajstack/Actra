@@ -23,6 +23,9 @@ class PlannerEngine {
    * @returns {{ intent, goal, required_apps, required_data, planned_actions, approval_required }}
    */
   async understandRequest(goal, chatHistory = []) {
+    if (this.modelGateway.getLastQuotaError && this.modelGateway.getLastQuotaError()) {
+      throw this.modelGateway.getLastQuotaError();
+    }
     if (!this.modelGateway.isAvailable()) {
       throw new Error('AI Model not available. Please configure your Cloudflare or Groq credentials in Settings (chrome://settings).');
     }
@@ -99,6 +102,9 @@ CRITICAL: YOU MUST OUTPUT ONLY RAW, VALID JSON. DO NOT WRAP YOUR RESPONSE IN MAR
    * @returns {{ interpretation: string, steps: Array, isComplete: boolean }}
    */
   async createPlan(understanding, pageContext, availableTools, chatHistory = [], executionHistory = []) {
+    if (this.modelGateway.getLastQuotaError && this.modelGateway.getLastQuotaError()) {
+      throw this.modelGateway.getLastQuotaError();
+    }
     if (!this.modelGateway.isAvailable()) {
       throw new Error('AI Model not available.');
     }
@@ -189,6 +195,9 @@ CRITICAL: YOU MUST OUTPUT ONLY RAW, VALID JSON. DO NOT WRAP YOUR RESPONSE IN MAR
    * Hard Completion Gate: Verifies if the goal was objectively achieved based on DOM state.
    */
   async verifyTaskCompletion(intent, pageContext, executionHistory = []) {
+    if (this.modelGateway.getLastQuotaError && this.modelGateway.getLastQuotaError()) {
+      return { goal_state_reached: false, reason: this.modelGateway.getLastQuotaError().message, missing_requirements: [] };
+    }
     if (!this.modelGateway.isAvailable()) {
       return { goal_state_reached: false, reason: 'AI Model not available for verification.', missing_requirements: [] };
     }
@@ -267,6 +276,9 @@ Find the exact ID (e.g. el-5) that best matches the description. Return empty st
    * @returns {Promise<Array<{answer_index: number, confidence: number, reasoning: string}>>}
    */
   async answerMCQBatch(questions, pageText = '', mcqModel) {
+    if (this.modelGateway.getLastQuotaError && this.modelGateway.getLastQuotaError()) {
+      throw this.modelGateway.getLastQuotaError();
+    }
     if (!this.modelGateway.isAvailable()) {
       throw new Error('AI Model not available.');
     }

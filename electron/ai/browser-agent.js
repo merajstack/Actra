@@ -420,6 +420,16 @@ class TaskDecomposer {
 
 // ─── BrowserAgent ────────────────────────────────────────────────────────────
 class BrowserAgent {
+  /**
+   * Returns true if an error is a ModelQuotaError (all model backends exhausted).
+   * Tested before expensive operations (screenshot, vision call) so we fail fast
+   * with the user-friendly message instead of wasting work.
+   * Avoids a hard `require` dependency cycle — checks duck-type properties instead.
+   */
+  static _isModelQuotaError(err) {
+    return Boolean(err && err.isModelQuotaError === true);
+  }
+
   constructor(deps) {
     this.tabManager              = deps.tabManager;
     this.taskManager             = deps.taskManager;
@@ -548,6 +558,16 @@ class BrowserAgent {
     this.taskManager.updateTaskStatus(task.id, 'executing');
     this._prewarmVisionServer();
 
+    // Fail fast if model quota is known to be exhausted
+    if (this.modelGateway?.isQuotaExhausted && this.modelGateway.isQuotaExhausted()) {
+      const quotaErr = this.modelGateway.getLastQuotaError();
+      this.taskManager.updateTaskStatus(task.id, 'failed', { error: quotaErr?.message });
+      if (assistantMsg?.id) {
+        await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${quotaErr?.message}` });
+      }
+      throw quotaErr;
+    }
+
     // ── Phase 0: Pronoun resolution (zero LLM if no pronouns detected) ──────
     command = await this._resolvePronouns(command);
 
@@ -663,6 +683,15 @@ class BrowserAgent {
           throw new Error('LLM returned empty plan');
         }
       } catch (llmErr) {
+        // Quota/fallback exhaustion — surface immediately; do NOT swallow into heuristic fallback.
+        if (BrowserAgent._isModelQuotaError(llmErr)) {
+          this.taskManager.updateStep(task.id, planStep.id, 'failed', llmErr.message);
+          this.taskManager.updateTaskStatus(task.id, 'failed', { error: llmErr.message });
+          if (assistantMsg?.id) {
+            await this.chatManager.updateMessage(assistantMsg.id, { content: `⚠️ ${llmErr.message}` });
+          }
+          throw llmErr;
+        }
         // ── Phase 3: Last-resort heuristic fallback ────────────────────
         console.warn('[BrowserAgent] LLM plan failed, trying heuristic fallback:', llmErr.message);
         plan = TaskDecomposer.inferFallback(command);
@@ -802,6 +831,14 @@ class BrowserAgent {
             newPlan?.interpretation || `Revised plan with ${newPlan?.steps?.length || 0} step(s)`
           );
         } catch (planErr) {
+          if (BrowserAgent._isModelQuotaError(planErr)) {
+            this.taskManager.updateStep(task.id, replanStep.id, 'failed', planErr.message);
+            this.taskManager.updateTaskStatus(task.id, 'failed', { error: planErr.message });
+            if (assistantMsg?.id) {
+              await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${planErr.message}` });
+            }
+            throw planErr;
+          }
           this.taskManager.updateStep(task.id, replanStep.id, 'failed', planErr.message);
           this.taskManager.updateTaskStatus(task.id, 'failed', { error: `Replanning failed: ${planErr.message}` });
           throw planErr;
@@ -1285,6 +1322,11 @@ class BrowserAgent {
             this.taskManager.updateStep(task.id, summaryStep.id, 'completed', 'Summary ready');
           } catch (llmErr) {
             this.taskManager.updateStep(task.id, summaryStep.id, 'failed', llmErr.message);
+            // Quota errors — surface immediately; do NOT silently fallback to raw text.
+            if (BrowserAgent._isModelQuotaError(llmErr)) {
+              this.taskManager.updateStep(task.id, stepEntry.id, 'failed', llmErr.message);
+              throw llmErr;
+            }
             // Fallback: return first 800 chars of raw text
             summary = `**Content from ${currentPageUrl}**\n\n${rawText.slice(0, 800)}\n\n_[Could not summarize — showing raw extract]_`;
           }
@@ -1654,6 +1696,29 @@ class BrowserAgent {
         break;
       }
 
+      // Check model availability BEFORE attempting screenshot capture
+      // Fail fast immediately if quota is exhausted or credentials are missing
+      try {
+        if (this.modelGateway?.checkAvailability) {
+          await this.modelGateway.checkAvailability();
+        }
+      } catch (availErr) {
+        if (BrowserAgent._isModelQuotaError(availErr)) {
+          const quotaMsg = availErr.message;
+          console.error(`[MCQ] Quota exhausted before question ${solved + 1}: ${quotaMsg}`);
+          this.taskManager.updateTaskStatus(task.id, 'failed', { error: quotaMsg });
+          if (assistantMsg?.id) {
+            await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${quotaMsg}` });
+          }
+          throw availErr;
+        }
+        this.taskManager.updateTaskStatus(task.id, 'failed', { error: availErr.message });
+        if (assistantMsg?.id) {
+          await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${availErr.message}` });
+        }
+        throw availErr;
+      }
+
       const qStartMs = Date.now();
 
       // Step 1: Capture screenshot for live preview in chat
@@ -1819,6 +1884,15 @@ Return JSON:
                 });
                 answer = data;
               } catch (reasonErr) {
+                if (BrowserAgent._isModelQuotaError(reasonErr)) {
+                  console.error(`[MCQ] Quota exhausted during vision reasoning: ${reasonErr.message}`);
+                  this.taskManager.updateStep(task.id, qStep.id, 'failed', reasonErr.message);
+                  this.taskManager.updateTaskStatus(task.id, 'failed', { error: reasonErr.message });
+                  if (assistantMsg?.id) {
+                    await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${reasonErr.message}` });
+                  }
+                  throw reasonErr;
+                }
                 try {
                   const chatRes = await this.modelGateway.chat(
                     [{ role: 'user', content: reasoningPrompt + '\nReturn ONLY raw JSON.' }],
@@ -1834,6 +1908,15 @@ Return JSON:
                   const jsonStr = cleaned.slice(cleaned.indexOf('{'), cleaned.lastIndexOf('}') + 1);
                   answer = JSON.parse(jsonStr);
                 } catch (chatErr) {
+                  if (BrowserAgent._isModelQuotaError(chatErr)) {
+                    console.error(`[MCQ] Quota exhausted during vision chat fallback: ${chatErr.message}`);
+                    this.taskManager.updateStep(task.id, qStep.id, 'failed', chatErr.message);
+                    this.taskManager.updateTaskStatus(task.id, 'failed', { error: chatErr.message });
+                    if (assistantMsg?.id) {
+                      await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${chatErr.message}` });
+                    }
+                    throw chatErr;
+                  }
                   console.warn('[MCQ] Vision path reasoning fallback failed:', chatErr.message);
                   answer = { answer_index: 0, confidence: 0.5 };
                 }
@@ -1869,6 +1952,15 @@ Return JSON:
               continue;
             }
           } catch (vErr) {
+            if (BrowserAgent._isModelQuotaError(vErr)) {
+              console.error(`[MCQ] Quota exhausted during vision extraction: ${vErr.message}`);
+              this.taskManager.updateStep(task.id, qStep.id, 'failed', vErr.message);
+              this.taskManager.updateTaskStatus(task.id, 'failed', { error: vErr.message });
+              if (assistantMsg?.id) {
+                await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${vErr.message}` });
+              }
+              throw vErr;
+            }
             console.warn('[MCQ] Vision fallback error:', vErr.message);
           }
         }
@@ -1950,6 +2042,15 @@ Return JSON:
         });
         answer = data;
       } catch (err) {
+        if (BrowserAgent._isModelQuotaError(err)) {
+          console.error(`[MCQ] Quota exhausted during structured output: ${err.message}`);
+          this.taskManager.updateStep(task.id, qStep.id, 'failed', err.message);
+          this.taskManager.updateTaskStatus(task.id, 'failed', { error: err.message });
+          if (assistantMsg?.id) {
+            await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${err.message}` });
+          }
+          throw err;
+        }
         // Fast JSON chat fallback
         try {
           const chatRes = await this.modelGateway.chat(
@@ -1961,6 +2062,15 @@ Return JSON:
           const jsonStr = cleaned.slice(cleaned.indexOf('{'), cleaned.lastIndexOf('}') + 1);
           answer = JSON.parse(jsonStr);
         } catch (chatErr) {
+          if (BrowserAgent._isModelQuotaError(chatErr)) {
+            console.error(`[MCQ] Quota exhausted during chat fallback: ${chatErr.message}`);
+            this.taskManager.updateStep(task.id, qStep.id, 'failed', chatErr.message);
+            this.taskManager.updateTaskStatus(task.id, 'failed', { error: chatErr.message });
+            if (assistantMsg?.id) {
+              await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${chatErr.message}` });
+            }
+            throw chatErr;
+          }
           console.warn('[MCQ] Fast reasoning failed:', chatErr.message);
           answer = { answer_index: 0, confidence: 0.5, reasoning: 'Fallback choice' };
         }

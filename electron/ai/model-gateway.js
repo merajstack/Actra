@@ -36,6 +36,81 @@ const CLOUDFLARE_INVALID_ACCOUNT_MESSAGE = 'Invalid key/account id, please check
 const ACTRA_AI_DAILY_LIMIT_MESSAGE = 'Actra AI daily limit finished, it resets at 00:00';
 const CLOUDFLARE_GENERIC_MESSAGE = 'Cloudflare request failed. Please try again later.';
 
+/**
+ * Typed error thrown when ALL available model backends are exhausted due to quota/auth.
+ * Callers should check `err.isModelQuotaError === true` to detect this case.
+ */
+class ModelQuotaError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.name = 'ModelQuotaError';
+    this.code = code;
+    this.isModelQuotaError = true;
+  }
+}
+
+/**
+ * Build the correct ModelQuotaError for the two quota failure modes.
+ *
+ * @param {'no_fallback'|'fallback_failed'} mode
+ * @param {string} [groqReason]  Short reason why Groq also failed (fallback_failed only)
+ */
+function createQuotaError(mode, groqReason) {
+  if (mode === 'no_fallback') {
+    return new ModelQuotaError(
+      'AI model limit reached for today (resets at 00:00) and no backup model is configured. ' +
+      'Add a Groq API key in Settings to avoid this, or try again after reset.',
+      'QUOTA_NO_FALLBACK'
+    );
+  }
+  // mode === 'fallback_failed'
+  const reason = groqReason || 'unknown error';
+  return new ModelQuotaError(
+    `AI model limit reached for today, and the backup model (Groq) also failed: ${reason}. ` +
+    'Please check your Groq API key in Settings or try again later.',
+    'QUOTA_FALLBACK_FAILED'
+  );
+}
+
+/**
+ * Classify a raw Groq error into a short human-readable reason string.
+ * Used in the second quota error message.
+ */
+function classifyGroqError(err) {
+  const msg = (err?.message || '').toLowerCase();
+  if (
+    msg.includes('invalid api key') ||
+    msg.includes('invalid_api_key') ||
+    msg.includes('incorrect api key') ||
+    msg.includes('authentication') ||
+    msg.includes('unauthorized') ||
+    /\b401\b/.test(msg)
+  ) return 'invalid API key';
+  if (
+    msg.includes('rate limit') ||
+    msg.includes('rate_limit') ||
+    msg.includes('too many requests') ||
+    /\b429\b/.test(msg)
+  ) return 'Groq rate limited';
+  if (
+    msg.includes('quota') ||
+    msg.includes('exceeded') ||
+    msg.includes('billing')
+  ) return 'Groq quota exceeded';
+  if (
+    msg.includes('timeout') ||
+    msg.includes('timed out') ||
+    msg.includes('abort')
+  ) return 'Groq request timed out';
+  if (
+    msg.includes('not found') ||
+    msg.includes('404')
+  ) return 'Groq API not found';
+  if (msg.includes('network') || msg.includes('fetch')) return 'network error reaching Groq';
+  // Return the first ~80 chars of the raw message as a fallback summary
+  return (err?.message || 'unknown error').slice(0, 80);
+}
+
 function createCloudflareUserError(message, code) {
   const error = new Error(message);
   error.code = code;
@@ -117,6 +192,31 @@ class ModelGateway {
     this.tokenBudget     = Infinity;
     this.availableModels = null;
     this.fetchingModels  = null;
+    this._lastQuotaError = null;
+  }
+
+  getLastQuotaError() {
+    return this._lastQuotaError || null;
+  }
+
+  isQuotaExhausted() {
+    return Boolean(this._lastQuotaError);
+  }
+
+  clearQuotaError() {
+    this._lastQuotaError = null;
+  }
+
+  async checkAvailability() {
+    if (this._lastQuotaError) {
+      throw this._lastQuotaError;
+    }
+    const { accountId: cfAccountId, apiToken: cfApiToken } = await this.getCloudflareCredentials();
+    const groqKey = await this.getApiKey();
+    if (!cfAccountId && !cfApiToken && !groqKey) {
+      throw new Error('AI credentials not configured. Please set your Groq API Key in Settings (chrome://settings).');
+    }
+    return true;
   }
 
   /**
@@ -187,6 +287,7 @@ class ModelGateway {
   }
 
   isAvailable() {
+    if (this._lastQuotaError) return false;
     return true;
   }
 
@@ -311,9 +412,17 @@ class ModelGateway {
     const { accountId: cfAccountId, apiToken: cfApiToken } = await this.getCloudflareCredentials();
     const groqKey = await this.getApiKey();
 
+    if (this._lastQuotaError) {
+      throw this._lastQuotaError;
+    }
+
     if (!cfAccountId && !cfApiToken && !groqKey) {
       throw new Error('AI credentials not configured. Please set your Groq API Key in Settings (chrome://settings).');
     }
+
+    // Track whether Cloudflare hit a quota/rate-limit error so we can emit the
+    // right user-facing message when the Groq fallback also fails.
+    let cfWasQuotaError = false;
 
     // ── Cloudflare path: only attempt if BOTH account ID and API token are present ──
     if (cfAccountId && cfApiToken) {
@@ -355,6 +464,7 @@ class ModelGateway {
         }
         
         console.log(`[ModelGateway] Cloudflare request succeeded!`);
+        this._lastQuotaError = null;
         
         if (isNativeOpenAI) {
           cfData.result = cfData;
@@ -394,12 +504,22 @@ class ModelGateway {
           cfError = createCloudflareUserError('Cloudflare request timed out.', 'CLOUDFLARE_TIMEOUT');
         }
 
+        // Record whether this was a quota/rate-limit hit so the Groq catch block
+        // below can emit the correct two-tier user-facing message.
+        cfWasQuotaError = (cfError.code === 'ACTRA_AI_DAILY_LIMIT');
+
         if (groqKey) {
           // Groq is available — fall through silently; never surface CF noise to the user.
           console.warn(`[ModelGateway] Cloudflare failed (${cfError.message}). Falling back to Groq.`);
         } else {
-          // No fallback — surface the most actionable error we can.
+          // No fallback available — surface the most actionable error we can.
           console.error(`[ModelGateway] Cloudflare failed with no Groq fallback: ${cfError.message}`);
+          // Case 1: quota exhausted, no Groq key at all → clear user-facing quota message.
+          if (cfWasQuotaError) {
+            const quotaErr = createQuotaError('no_fallback');
+            this._lastQuotaError = quotaErr;
+            throw quotaErr;
+          }
           throw cfError.isCloudflareUserError
             ? cfError
             : createCloudflareUserError(CLOUDFLARE_GENERIC_MESSAGE, 'CLOUDFLARE_REQUEST_FAILED');
@@ -415,8 +535,25 @@ class ModelGateway {
     // Map CF model role back to a valid Groq model
     const resolvedGroqModel = await this._cfModelToGroq(payload.model);
     console.log(`[ModelGateway] Groq fallback → ${resolvedGroqModel}`);
-    return await this._fetchGroq({ ...payload, model: resolvedGroqModel });
+    try {
+      const result = await this._fetchGroq({ ...payload, model: resolvedGroqModel });
+      this._lastQuotaError = null;
+      return result;
+    } catch (groqErr) {
+      // Case 2: Cloudflare previously hit a quota error and Groq also fails.
+      // Emit the user-friendly two-tier message instead of raw Groq noise.
+      if (cfWasQuotaError) {
+        const reason = classifyGroqError(groqErr);
+        console.error(`[ModelGateway] CF quota + Groq fallback also failed (${reason}): ${groqErr.message}`);
+        const quotaErr = createQuotaError('fallback_failed', reason);
+        this._lastQuotaError = quotaErr;
+        throw quotaErr;
+      }
+      // Groq was the primary provider and it failed — re-throw as-is.
+      throw groqErr;
+    }
   }
+
 
   /**
    * Map a Cloudflare model ID to the closest available Groq model.
@@ -703,3 +840,4 @@ class ModelGateway {
 }
 
 module.exports = ModelGateway;
+module.exports.ModelQuotaError = ModelQuotaError;
