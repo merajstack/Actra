@@ -8,7 +8,16 @@
  *   → preparing → waiting_approval → executing → verifying
  *   → logging → completed
  *
- * Error paths:
+ * Step statuses:
+ *   pending   — not yet started
+ *   running   — currently executing
+ *   completed — finished successfully and (if applicable) post-condition verified
+ *   failed    — threw an exception during execution
+ *   verified_failed — action dispatched, but post-condition check found no DOM
+ *                     state change ("clicked but nothing happened"). Distinct from
+ *                     'failed' so the UI can show a more precise message.
+ *
+ * Task error paths:
  *   any state → failed
  *   waiting_approval → rejected (user explicitly rejects)
  *   any state → cancelled

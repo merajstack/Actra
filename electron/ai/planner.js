@@ -24,7 +24,7 @@ class PlannerEngine {
    */
   async understandRequest(goal, chatHistory = []) {
     if (!this.modelGateway.isAvailable()) {
-      throw new Error('AI Model not available. Please set GROQ_API_KEY in .env');
+      throw new Error('AI Model not available. Please configure your Cloudflare or Groq credentials in Settings (chrome://settings).');
     }
 
     const schema = {
@@ -37,33 +37,7 @@ class PlannerEngine {
           enum: ['INFORMATIONAL', 'GOOGLE_WORKSPACE_API', 'BROWSER_UI'],
           description: 'The primary target platform for execution.'
         },
-        route: {
-          type: 'string',
-          enum: ['ACTION_SIMPLE', 'ACTION_COMPLEX'],
-          description: 'Only applies if execution_target is BROWSER_UI. ACTION_SIMPLE for basic web navigation/clicks. ACTION_COMPLEX for research, scraping, or multi-step logic.'
-        },
-        simple_plan: {
-          type: 'array',
-          description: 'If route is ACTION_SIMPLE, provide the exact deterministic browser steps needed.',
-          items: {
-            type: 'object',
-            properties: {
-              action: { type: 'string', enum: ['browser_navigate', 'browser_type', 'browser_click', 'browser_press_key', 'browser_scroll'] },
-              description: { type: 'string', description: 'Human-readable description (e.g. "Opening YouTube")' },
-              args: {
-                type: 'object',
-                properties: {
-                  url: { type: 'string' },
-                  targetDescription: { type: 'string' },
-                  text: { type: 'string' },
-                  key: { type: 'string' },
-                  amount: { type: 'number' }
-                }
-              }
-            },
-            required: ['action', 'description']
-          }
-        },
+
         required_apps:    { type: 'array',   items: { type: 'string' }, description: 'Which Workspace apps are needed: gmail, calendar, sheets, drive, docs' },
         required_data:    { type: 'array',   items: { type: 'string' }, description: 'What data needs to be retrieved before acting' },
         planned_actions:  { type: 'array',   items: { type: 'string' }, description: 'High-level action names: search_gmail, send_email, get_calendar_events, write_sheet, etc.' },
@@ -98,22 +72,15 @@ You must output an \`execution_target\` choosing from:
 - Use if the user is only asking a general question (e.g., "How does Gmail work?", "What is 2+2?").
 
 2. execution_target: GOOGLE_WORKSPACE_API
-- Use if the user wants to RETRIEVE, SEARCH, READ, SUMMARIZE, ANALYZE, CREATE, UPDATE, or otherwise operate on Google Workspace data.
-- Examples: "Get my latest emails", "What's on my calendar tomorrow?", "Find my budget spreadsheet", "Send an email to John".
-- The word "Gmail", "Drive", "Sheets", or "Calendar" alone MUST NOT cause browser navigation.
-- Do NOT substitute browser automation for an existing backend capability. DO NOT open mail.google.com to read emails.
+- MUST BE USED for ANY request involving Gmail, emails, inbox, calendar, meetings, sheets, spreadsheets, docs, or drive.
+- Examples: "Open my mail and check my mails", "Check if I got any emails about X", "What's on my calendar?", "Find my spreadsheet", "Send an email".
+- ALWAYS check internally via Google Workspace APIs. NEVER open browser tabs or navigate to mail.google.com / docs.google.com.
+- The browser has direct Google Workspace API authorization.
 
 3. execution_target: BROWSER_UI
-- Use ONLY when the user explicitly requests UI interaction, or for external websites without a dedicated backend integration.
-- Examples of explicit UI requests: "Open Gmail", "Click the Inbox in Gmail", "Open this spreadsheet in the browser".
-- Examples of external websites: "Open YouTube and play a MrBeast video", "Search Google for laptops", "Scroll down the article".
-- Hybrid browser + Workspace requests MUST use BROWSER_UI if any external web page must be opened, searched, scrolled, or scraped, and MUST still list required Workspace apps such as "gmail" when the result will be emailed.
-- For BROWSER_UI, you MUST specify \`route\`:
-  - ACTION_SIMPLE for deterministic steps.
-  - ACTION_COMPLEX for multi-step reasoning web agents.
-- For ACTION_SIMPLE, you MUST populate \`simple_plan\` with the COMPLETE set of deterministic browser actions needed (browser_navigate, browser_type, browser_click, browser_press_key).
-- If the user asks to capture, scrape, extract, research, summarize, or email page content after browser navigation, use ACTION_COMPLEX, not ACTION_SIMPLE.
-- CRITICAL: If you type into a search box, you MUST include a \`browser_press_key\` step with key "Enter".
+- Use ONLY for external non-workspace websites (e.g. YouTube, GitHub, Twitter, Amazon, Reddit, Wikipedia, search engines).
+- Examples: "Open YouTube and play a video", "Search Google for laptops", "Visit reddit.com".
+- NEVER use BROWSER_UI for checking or interacting with user emails, docs, sheets, drive, or calendar.
 If the user says "send", "write", "create", "update", "draft" → approval_required = true
 
 CRITICAL: YOU MUST OUTPUT ONLY RAW, VALID JSON. DO NOT WRAP YOUR RESPONSE IN MARKDOWN \`\`\`json BLOCKS. ANY TEXT OUTSIDE THE JSON WILL CAUSE A SYSTEM FAILURE.`;
@@ -145,10 +112,18 @@ CRITICAL: YOU MUST OUTPUT ONLY RAW, VALID JSON. DO NOT WRAP YOUR RESPONSE IN MAR
           items: {
             type: 'object',
             properties: {
-              action:      { type: 'string', description: 'Exact tool name from the available list' },
-              description: { type: 'string', description: 'Human-readable step description' },
-              args:        { type: 'object', description: 'Arguments to pass to the tool' },
-              riskLevel:   { type: 'number', description: '0=read/safe, 2=write/requires approval' },
+              action:              { type: 'string', description: 'Exact tool name from the available list' },
+              description:         { type: 'string', description: 'Human-readable step description' },
+              args:                { type: 'object', description: 'Arguments to pass to the tool' },
+              riskLevel:           { type: 'number', description: '0=read/safe, 2=write/requires approval' },
+              expectedPostState:   {
+                type: ['string', 'null'],
+                description: 'Optional. A short, testable description of the observable state that should be true AFTER this step succeeds. Examples: "url contains /results", "input value equals search text", "checkbox becomes checked", "button aria-selected equals true". Leave null for non-mutating steps (navigate, wait, extract).',
+              },
+              preferVision:        {
+                type: 'boolean',
+                description: 'Optional. True if step is on complex visual SPA domains (e.g. YouTube, media players, canvas apps) or when previous steps failed verification, to prefer vision grounding directly.',
+              },
             },
             required: ['action', 'description', 'args', 'riskLevel'],
           },
@@ -193,7 +168,16 @@ Create a MACRO-PLAN to complete the task. Rules:
 5. When a later step needs current page text, add \`browser_extract_page_text\` after the page is open and any requested scroll has happened.
 6. When sending extracted page text by email, set \`send_email.args.body\` to the placeholder string \`{{browser_extract_page_text.text}}\` so the executor can insert the captured text before approval.
 7. If the user asks for a known Wikipedia topic, prefer direct navigation to the canonical article URL, e.g. https://en.wikipedia.org/wiki/Tiger.
+8. For \`search_gmail\`, use clean, concise keywords in \`args.query\` (e.g. 'Adobe hackathon' or 'Adobe' or 'Takeover'). Avoid exact quotes or conversational phrases.
+9. HYBRID WORKFLOWS (Web Research / Page Extraction + Send Email):
+   - When the user asks to open a website (e.g. Wikipedia, article, search), research/extract data, and send an email:
+     Step 1: \`browser_navigate\` to the target website URL (e.g. https://en.wikipedia.org/wiki/Peafowl).
+     Step 2: \`browser_extract_page_text\` to capture the page content (and/or \`browser_take_screenshot\` if requested).
+     Step 3: \`send_email\` with recipient in \`args.to\`, descriptive \`args.subject\`, and \`args.body\` set to \`{{browser_extract_page_text.text}}\` (riskLevel: 2).
+   - NEVER call \`search_gmail\` when the goal is to research an external site and SEND an email.
 - Ensure you provide ALL necessary arguments to the tool according to its schema.
+10. For every mutating step (\`browser_click\`, \`browser_type\`), set \`expectedPostState\` to a short testable assertion about what should be observable after the step (e.g. "input value equals search query", "aria-checked equals true", "url contains /dashboard"). For non-mutating steps (navigate, wait, extract) leave \`expectedPostState\` as null.
+11. For complex visual SPAs (like YouTube, media sites, canvas web apps) or when execution history indicates verification failure, set \`preferVision: true\` on click/type steps so the executor bypasses fragile DOM heuristics and prioritizes visual grounding.
 
 CRITICAL: YOU MUST OUTPUT ONLY RAW, VALID JSON. DO NOT WRAP YOUR RESPONSE IN MARKDOWN \`\`\`json BLOCKS. DO NOT ADD ANY CONVERSATIONAL TEXT.`;
 
@@ -272,6 +256,63 @@ Find the exact ID (e.g. el-5) that best matches the description. Return empty st
     } catch {
       return null;
     }
+  }
+  /**
+   * Answer a batch of MCQ questions in a single structured LLM call.
+   *
+   * @param {Array<{question: string, options: string[]}>} questions
+   * @param {string} pageText    Full page text for additional context
+   * @param {string} [mcqModel]  Optional Cloudflare model ID from the subject dropdown.
+   *                             When provided, overrides the default planner model.
+   * @returns {Promise<Array<{answer_index: number, confidence: number, reasoning: string}>>}
+   */
+  async answerMCQBatch(questions, pageText = '', mcqModel) {
+    if (!this.modelGateway.isAvailable()) {
+      throw new Error('AI Model not available.');
+    }
+
+    const schema = {
+      type: 'object',
+      properties: {
+        answers: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              answer_index: { type: 'number', description: '0-based index of the correct option in the options array' },
+              confidence:   { type: 'number', description: 'Confidence score between 0 and 1 (e.g. 0.9 = very confident)' },
+              reasoning:    { type: 'string', description: 'One-sentence explanation of why this option is correct' },
+            },
+            required: ['answer_index', 'confidence', 'reasoning'],
+          },
+          description: 'One answer object per question, in the same order as the input questions array',
+        },
+      },
+      required: ['answers'],
+    };
+
+    const questionsText = questions.map((q, i) => {
+      const opts = q.options.map((o, j) => `  ${j}. ${o}`).join('\n');
+      return `Question ${i + 1}: ${q.question}\nOptions:\n${opts}`;
+    }).join('\n\n');
+
+    const pageSnippet = pageText ? `\n\nPage context (first 4000 chars):\n${pageText.slice(0, 4000)}` : '';
+
+    const prompt = `You are an expert exam solver. Answer every question below accurately.
+For each question return the 0-based index of the SINGLE correct option, a confidence score (0–1), and a short reasoning string.
+Return answers in the SAME ORDER as the questions.${pageSnippet}
+
+${questionsText}
+
+CRITICAL: Output only raw valid JSON. Do NOT wrap in markdown code fences.`;
+
+    const { data } = await this.modelGateway.structuredOutput(prompt, schema, {
+      temperature: 0.05,
+      role: 'planner',
+      ...(mcqModel ? { model: mcqModel } : {}),
+    });
+
+    return Array.isArray(data?.answers) ? data.answers : [];
   }
 }
 

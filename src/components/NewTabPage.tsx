@@ -146,9 +146,9 @@ export const NewTabPage: React.FC<NewTabPageProps> = ({ onNavigate, isIncognito 
 
       <div className="w-full max-w-2xl flex flex-col items-center space-y-8 my-auto">
         {/* Logo & Title */}
-        <div className="flex flex-col items-center space-y-4">
-          <img src="logo.png" alt="Actra AI Logo" className="h-24 object-contain drop-shadow-md" />
-          <p className="text-xs text-zinc-500 font-medium">Blazing fast Chromium-powered desktop browser for macOS</p>
+        <div className="flex flex-col items-center space-y-0">
+          <img src="./tab-icon.png" alt="Actra" className="h-[336px] w-[336px] max-w-full object-contain drop-shadow-md" />
+          <p className="text-xs text-zinc-500 font-medium">Built for achievers who automate their work</p>
         </div>
 
         {/* Search Omnibox */}

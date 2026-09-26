@@ -13,22 +13,42 @@ class TabManager {
     this.activeTabId = null;
     this.closedTabHistory = [];     // stack of { url, title } for reopen
     this.maxClosedHistory = 20;
+    this.sidebarWidth = 0;
+    this.rightOverlayWidth = 0;
+    this._resizeTimer = null;
 
-    // Listen for resize to update active view bounds
-    this.mainWindow.on('resize', () => {
+    // Debounced resize — fires at most once per 16ms (~60fps) during window drag.
+    // This prevents bounds thrashing while the user is actively resizing the window.
+    const onResize = () => {
+      clearTimeout(this._resizeTimer);
+      this._resizeTimer = setTimeout(() => {
+        if (this.activeTabId) {
+          const view = this.tabs.get(this.activeTabId);
+          if (view) this.updateViewBounds(view);
+        }
+      }, 16);
+    };
+
+    this.mainWindow.on('resize', onResize);
+
+    // Sync bounds immediately when entering/leaving fullscreen
+    const onFullscreenChange = () => {
       if (this.activeTabId) {
         const view = this.tabs.get(this.activeTabId);
         if (view) this.updateViewBounds(view);
       }
-    });
+    };
+    this.mainWindow.on('enter-full-screen', onFullscreenChange);
+    this.mainWindow.on('leave-full-screen', onFullscreenChange);
   }
+
 
   /**
    * Create a new tab with its own independent BrowserView.
    * Each BrowserView gets its own webContents (Chromium renderer process).
    */
-  createTab(url = 'https://www.google.com', isIncognito = false) {
-    const tabId = `view-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  createTab(url = 'https://www.google.com', isIncognito = false, customTabId = null) {
+    const tabId = customTabId || `view-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
     const view = new BrowserView({
       webPreferences: {
@@ -41,7 +61,9 @@ class TabManager {
     });
 
     this.tabs.set(tabId, view);
-    this.tabOrder.push(tabId);
+    if (!this.tabOrder.includes(tabId)) {
+      this.tabOrder.push(tabId);
+    }
     this.setActiveTab(tabId);
 
     // ── Per-Tab Event Listeners (scoped to this tab's webContents) ──
@@ -255,15 +277,20 @@ class TabManager {
    * Navigate a specific tab to a URL. Only affects THIS tab.
    */
   navigateTab(tabId, url) {
-    const view = this.tabs.get(tabId);
-    if (!view) return;
+    let view = this.tabs.get(tabId);
+    if (!view) {
+      if (url && url !== 'chrome://newtab') {
+        this.createTab(url, false, tabId);
+      }
+      return;
+    }
 
     if (url === 'chrome://newtab') {
       // Hide native view, let React render the new-tab page
-      this.mainWindow.removeBrowserView(view);
+      try { this.mainWindow.removeBrowserView(view); } catch (e) {}
       view.webContents.loadURL('about:blank');
     } else {
-      this.mainWindow.addBrowserView(view);
+      try { this.mainWindow.addBrowserView(view); } catch (e) {}
       this.updateViewBounds(view);
       view.webContents.loadURL(url);
     }
@@ -340,6 +367,10 @@ class TabManager {
   /**
    * Per-tab reload. Only affects the specified tab.
    */
+  reload(tabId) {
+    return this.reloadTab(tabId);
+  }
+
   reloadTab(tabId) {
     const view = this.tabs.get(tabId);
     if (view) view.webContents.reload();
@@ -478,6 +509,28 @@ class TabManager {
       height: Math.max(height - yOffset, 100)
     });
     view.setAutoResize({ width: true, height: true });
+  }
+
+  /**
+   * Set sidebar width (left panel) and resize active BrowserView.
+   */
+  setSidebarWidth(width) {
+    this.sidebarWidth = Math.max(0, Math.round(width || 0));
+    if (this.activeTabId) {
+      const view = this.tabs.get(this.activeTabId);
+      if (view) this.updateViewBounds(view);
+    }
+  }
+
+  /**
+   * Set right overlay width and resize active BrowserView.
+   */
+  setRightOverlayWidth(width) {
+    this.rightOverlayWidth = Math.max(0, Math.round(width || 0));
+    if (this.activeTabId) {
+      const view = this.tabs.get(this.activeTabId);
+      if (view) this.updateViewBounds(view);
+    }
   }
 
   // ── Private Helpers ──

@@ -20,6 +20,8 @@ import { AIChat } from './components/ai/AIChat';
 import { VoiceCommandBar } from './components/VoiceCommandBar';
 
 import { OnboardingPage } from './components/OnboardingPage';
+import { LocalModelsSetup } from './components/LocalModelsSetup';
+import { ActraLoader } from './components/ActraLoader';
 
 // Virtual Cursor
 const VirtualCursor = ({ visible, url }: { visible: boolean, url: string }) => {
@@ -94,16 +96,30 @@ export default function App() {
   const [showBookmarksBar, setShowBookmarksBar] = useState(false);
 
   // AI State
-  const [showCommandBar, setShowCommandBar] = useState(false);
   const [showVoiceBar, setShowVoiceBar] = useState(false);
   const [showAIPanel, setShowAIPanel] = useState(false);
+  const [aiSidebarWidth, setAiSidebarWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('actra_ai_sidebar_width');
+      const parsed = saved ? parseInt(saved, 10) : 400;
+      return parsed >= 300 && parsed <= 720 ? parsed : 400;
+    } catch {
+      return 400;
+    }
+  });
+  const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const [chromeHeight, setChromeHeight] = useState(122);
   const [virtualCursorURL, setVirtualCursorURL] = useState<string | null>(null);
   const [approvals, setApprovals] = useState<AIApprovalRequest[]>([]);
+  const [updateStatus, setUpdateStatus] = useState<{ status: string; version?: string; percent?: number; message?: string } | null>(null);
+  const [localModelStatus, setLocalModelStatus] = useState<any | null>(null);
+  const [localModelsSkipped, setLocalModelsSkipped] = useState(false);
 
   const activeTab = tabs.find(t => t.id === activeTabId) || tabs[0];
 
   const isElectron = !!(window as any).electronAPI;
+
+  const effectiveSidebarWidth = (showAIPanel && !activeTab.isIncognito) ? aiSidebarWidth : 0;
 
   // Measure and report UI chrome dimensions to Electron
   const headerRef = useRef<HTMLDivElement>(null);
@@ -124,9 +140,70 @@ export default function App() {
   }, [isElectron]);
 
   useEffect(() => {
-    if (!isElectron || typeof (window as any).electronAPI.setRightOverlayWidth !== 'function') return;
-    (window as any).electronAPI.setRightOverlayWidth(showAIPanel ? 452 : 0);
-  }, [isElectron, showAIPanel]);
+    if (!isElectron) return;
+    if (typeof (window as any).electronAPI.setRightOverlayWidth === 'function') {
+      (window as any).electronAPI.setRightOverlayWidth(0);
+    }
+    if (typeof (window as any).electronAPI.setSidebarWidth === 'function') {
+      (window as any).electronAPI.setSidebarWidth(effectiveSidebarWidth);
+    }
+  }, [isElectron, effectiveSidebarWidth]);
+
+  const handleStartResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    setIsResizingSidebar(true);
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const maxAllowed = Math.min(window.innerWidth - 300, 720);
+      const newWidth = Math.max(300, Math.min(moveEvent.clientX, maxAllowed));
+      setAiSidebarWidth(newWidth);
+      if (isElectron && typeof (window as any).electronAPI?.setSidebarWidth === 'function') {
+        (window as any).electronAPI.setSidebarWidth(newWidth);
+      }
+    };
+
+    const onMouseUp = (upEvent: MouseEvent) => {
+      setIsResizingSidebar(false);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      const maxAllowed = Math.min(window.innerWidth - 300, 720);
+      const finalWidth = Math.max(300, Math.min(upEvent.clientX, maxAllowed));
+      setAiSidebarWidth(finalWidth);
+      try {
+        localStorage.setItem('actra_ai_sidebar_width', String(finalWidth));
+      } catch {}
+      if (isElectron && typeof (window as any).electronAPI?.setSidebarWidth === 'function') {
+        (window as any).electronAPI.setSidebarWidth(finalWidth);
+      }
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  };
+
+  useEffect(() => {
+    if (!isElectron || typeof (window as any).electronAPI.onUpdaterStatus !== 'function') return;
+    (window as any).electronAPI.onUpdaterStatus((status: { status: string; version?: string; percent?: number; message?: string }) => {
+      setUpdateStatus(status);
+    });
+  }, [isElectron]);
+
+  useEffect(() => {
+    if (!isElectron || typeof (window as any).electronAPI.getLocalModelStatus !== 'function') return;
+    const api = (window as any).electronAPI;
+    api.getLocalModelStatus().then((status: any) => setLocalModelStatus(status)).catch((error: Error) => {
+      setLocalModelStatus({ ready: false, downloading: false, files: [], error: error.message });
+    });
+    if (typeof api.onLocalModelsStatus === 'function') {
+      api.onLocalModelsStatus((status: any) => setLocalModelStatus(status));
+    }
+  }, [isElectron]);
+
+  const handleDownloadLocalModels = async () => {
+    if (!isElectron) return;
+    const status = await (window as any).electronAPI.downloadLocalModels();
+    setLocalModelStatus(status);
+  };
 
   // Initialize Electron tab
   useEffect(() => {
@@ -170,6 +247,17 @@ export default function App() {
       setActiveTabId(data.tabId);
       setBrowserMode('browser');
     });
+    // AI-triggered tab switch (e.g. MCQ solver switching to tab 1)
+    if (typeof (window as any).electronAPI.onTabActivated === 'function') {
+      (window as any).electronAPI.onTabActivated((data: any) => {
+        setActiveTabId(data.tabId);
+        setBrowserMode('browser');
+        // Tell Electron to also show the BrowserView for this tab
+        if (typeof (window as any).electronAPI.setActiveTab === 'function') {
+          (window as any).electronAPI.setActiveTab(data.tabId);
+        }
+      });
+    }
     (window as any).electronAPI.onDownloadProgress((data: any) => {
       setDownloads(prev => {
         const exists = prev.find(d => d.filename === data.fileName);
@@ -252,13 +340,32 @@ export default function App() {
   }, [isElectron]);
 
   // BrowserView visibility — show native BrowserView only when in browser mode with a real URL
-  // BrowserView visibility — show native BrowserView only when in browser mode with a real URL
   useEffect(() => {
     if (!isElectron) return;
     const isInternalPage = activeTab.url.startsWith('chrome://');
     const shouldShowNativeView = browserMode === 'browser' && !isInternalPage;
     (window as any).electronAPI.setVisibility(activeTabId, shouldShowNativeView);
   }, [browserMode, activeTabId, activeTab.url, isElectron]);
+
+  // ── BrowserView z-order fix: hide native view when any React overlay is open ──
+  // Electron's BrowserView is a native OS surface that sits ABOVE all React DOM —
+  // no z-index can fix this. We must detach the BrowserView from the window while
+  // any toolbar overlay (menu, omnibox dropdown, downloads, site info) is visible.
+  useEffect(() => {
+    if (!isElectron) return;
+    const api = (window as any).electronAPI;
+    const handleOverlayChange = (e: Event) => {
+      const { open } = (e as CustomEvent).detail;
+      const isInternalPage = activeTab.url.startsWith('chrome://');
+      const isRealBrowserTab = browserMode === 'browser' && !isInternalPage;
+      if (isRealBrowserTab) {
+        // Hide the BrowserView while overlay is open, restore when closed
+        api.setVisibility(activeTabId, !open);
+      }
+    };
+    window.addEventListener('toolbar-overlay-change', handleOverlayChange);
+    return () => window.removeEventListener('toolbar-overlay-change', handleOverlayChange);
+  }, [isElectron, activeTabId, activeTab.url, browserMode]);
 
   // ── COMMAND PALETTE: Keyboard Shortcuts (IPC from Native Menu) ──
   useEffect(() => {
@@ -327,7 +434,7 @@ export default function App() {
     api.onMenuFind(() => setShowFindBar(prev => !prev));
     api.onMenuHistory(() => setBrowserMode('history'));
     api.onMenuDownloads(() => setBrowserMode('downloads'));
-    api.onMenuCommandBar(() => setShowCommandBar(prev => !prev));
+    api.onMenuCommandBar(() => setShowAIPanel(prev => !prev));
     
     const handleVoiceDown = () => {
       setShowVoiceBar(true); // Always ensure it's visible
@@ -359,7 +466,7 @@ export default function App() {
       else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'j') { e.preventDefault(); setBrowserMode('downloads'); }
       else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'l') { e.preventDefault(); window.dispatchEvent(new Event('focus-url')); }
       else if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'b') { e.preventDefault(); setShowBookmarksBar(prev => !prev); }
-      else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setShowCommandBar(prev => !prev); }
+      else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setShowAIPanel(prev => !prev); }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
@@ -546,7 +653,10 @@ export default function App() {
   return (
     <div className={`absolute inset-0 w-full h-full flex flex-col overflow-hidden font-sans select-none ${
       activeTab.isIncognito ? 'bg-zinc-950 text-zinc-100' : 'bg-[#FDFBF7] text-zinc-800'
-    }`}>
+      }`}>
+      {isElectron && localModelStatus && !localModelStatus.ready && !localModelsSkipped && (
+        <LocalModelsSetup status={localModelStatus} onDownload={handleDownloadLocalModels} onSkip={() => setLocalModelsSkipped(true)} />
+      )}
       {/* Browser Chrome Header (Chrome-style top TabStrip + Toolbar + BookmarksBar) */}
       <div ref={headerRef} className="flex flex-col shrink-0 select-none z-30">
         {/* Multi-Tab Strip (Mac Traffic lights sit on the left with pl-[76px]) */}
@@ -582,6 +692,7 @@ export default function App() {
             }
           }}
           onOpenAIPanel={() => setShowAIPanel(prev => !prev)}
+          isAIPanelOpen={showAIPanel && !activeTab.isIncognito}
         />
 
         {/* Navigation Toolbar */}
@@ -619,104 +730,133 @@ export default function App() {
         )}
       </div>
 
+      {updateStatus && ['available', 'downloading', 'downloaded', 'error'].includes(updateStatus.status) && (
+        <div className="fixed top-3 right-4 z-[100000] w-80 rounded-xl border border-orange-200 bg-white p-4 shadow-xl">
+          <div className="text-sm font-semibold text-zinc-800">
+            {updateStatus.status === 'available' && `Actra ${updateStatus.version || ''} is available`}
+            {updateStatus.status === 'downloading' && 'Downloading Actra update...'}
+            {updateStatus.status === 'downloaded' && `Actra ${updateStatus.version || ''} is ready to install`}
+            {updateStatus.status === 'error' && 'Actra update check failed'}
+          </div>
+          {updateStatus.status === 'downloading' && <div className="mt-2 text-xs text-zinc-500">{updateStatus.percent || 0}% downloaded</div>}
+          {updateStatus.status === 'error' && <div className="mt-1 text-xs text-red-600">{updateStatus.message || 'Try again later.'}</div>}
+          {updateStatus.status === 'downloaded' && (
+            <button onClick={() => (window as any).electronAPI.installUpdate()} className="mt-3 rounded-lg bg-orange-500 px-3 py-2 text-xs font-semibold text-white hover:bg-orange-600">
+              Restart to Update
+            </button>
+          )}
+          <button onClick={() => setUpdateStatus(null)} className="absolute right-2 top-2 p-1 text-zinc-400 hover:text-zinc-700" title="Dismiss">×</button>
+        </div>
+      )}
+
       {/* Main Content Body */}
-      <div className="flex-1 flex flex-col relative overflow-hidden">
-        {/* Find in Page Bar */}
-        {showFindBar && <FindInPageBar onClose={() => setShowFindBar(false)} />}
-
-        {/* View Switcher */}
-        {browserMode === 'history' || activeTab.url === 'chrome://history' ? (
-          <HistoryPage
-            history={history}
-            onNavigate={handleNavigate}
-            onDeleteHistoryItem={(id) => setHistory(prev => prev.filter(h => h.id !== id))}
-            onClearAllHistory={() => setHistory([])}
-            onBackToBrowser={() => setBrowserMode('browser')}
-          />
-        ) : browserMode === 'bookmarks' || activeTab.url === 'chrome://bookmarks' ? (
-          <BookmarksPage
-            bookmarks={bookmarks}
-            folders={folders}
-            onNavigate={handleNavigate}
-            onDeleteBookmark={(id) => setBookmarks(prev => prev.filter(b => b.id !== id))}
-            onAddBookmark={(title, url, folderId) => setBookmarks(prev => [{ id: `b-${Date.now()}`, title, url, folderId, dateAdded: Date.now() }, ...prev])}
-            onBackToBrowser={() => setBrowserMode('browser')}
-          />
-        ) : browserMode === 'downloads' || activeTab.url === 'chrome://downloads' ? (
-          <DownloadsPage
-            downloads={downloads}
-            onClearDownloads={() => setDownloads([])}
-            onBackToBrowser={() => setBrowserMode('browser')}
-          />
-        ) : browserMode === 'settings' || activeTab.url === 'chrome://settings' ? (
-          <SettingsPage onBackToBrowser={() => setBrowserMode('browser')} />
-        ) : browserMode === 'help' || activeTab.url === 'chrome://help' ? (
-          <HelpPage onBackToBrowser={() => setBrowserMode('browser')} />
-        ) : activeTab.url === 'chrome://newtab' ? (
-          <NewTabPage 
-            onNavigate={handleNavigate} 
-            isIncognito={activeTab.isIncognito || false} 
-            userProfile={userProfile}
-            onLogout={async () => {
-              setIsOnboardingComplete(false);
-              setUserProfile(null);
-              await supabase.from('settings').delete().in('key', ['onboardingComplete', 'userProfile', 'cloudflareAccountId', 'cloudflareApiKey', 'groqKey']);
-              if (isElectron) {
-                await (window as any).electronAPI.clearData();
-              }
-            }}
-          />
-        ) : isElectron ? (
-          // In Electron mode, the native BrowserView renders on top — show nothing here.
-          // This prevents the React iframe fallback from interfering with the native renderer.
-          <div className="flex-1" />
-        ) : (
-          <BrowserContent
-            url={activeTab.url}
-            zoomLevel={activeTab.zoomLevel}
-            isIncognito={activeTab.isIncognito || false}
-            onNavigate={handleNavigate}
-          />
+      <div className="flex-1 flex flex-row relative overflow-hidden min-h-0">
+        {/* Left Actra AI Sidebar */}
+        {showAIPanel && !activeTab.isIncognito && (
+          <aside
+            style={{ width: `${aiSidebarWidth}px` }}
+            className="h-full flex shrink-0 relative z-20 border-r border-[#E8E2D5] bg-[#FDFBF7] flex-col overflow-hidden"
+          >
+            <AIChat
+              activeTabId={activeTabId}
+              onClose={() => setShowAIPanel(false)}
+              approvals={approvals}
+              setApprovals={setApprovals}
+              isExpanded={aiSidebarWidth >= 520}
+              onToggleExpand={() => {
+                setAiSidebarWidth(prev => {
+                  const next = prev >= 520 ? 400 : 580;
+                  try { localStorage.setItem('actra_ai_sidebar_width', String(next)); } catch {}
+                  if (isElectron && typeof (window as any).electronAPI?.setSidebarWidth === 'function') {
+                    (window as any).electronAPI.setSidebarWidth(next);
+                  }
+                  return next;
+                });
+              }}
+            />
+            {/* Drag Resize Handle */}
+            <div
+              onMouseDown={handleStartResize}
+              className="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-orange-500/40 active:bg-orange-500 transition-colors z-30 select-none group flex items-center justify-center"
+              title="Drag to resize Actra AI"
+            >
+              <div className="w-0.5 h-8 bg-zinc-300 group-hover:bg-orange-500 rounded-full transition-colors" />
+            </div>
+          </aside>
         )}
 
-        {/* Chromium DevTools Panel Drawer */}
-        {showDevTools && (
-          <DevToolsPanel
-            currentUrl={activeTab.url}
-            onClose={() => setShowDevTools(false)}
-          />
-        )}
+        {/* Running Tab & Content Viewport */}
+        <div className="flex-1 flex flex-col relative overflow-hidden min-w-0 min-h-0">
+          {/* Find in Page Bar */}
+          {showFindBar && <FindInPageBar onClose={() => setShowFindBar(false)} />}
+
+          {/* View Switcher */}
+          {browserMode === 'history' || activeTab.url === 'chrome://history' ? (
+            <HistoryPage
+              history={history}
+              onNavigate={handleNavigate}
+              onDeleteHistoryItem={(id) => setHistory(prev => prev.filter(h => h.id !== id))}
+              onClearAllHistory={() => setHistory([])}
+              onBackToBrowser={() => setBrowserMode('browser')}
+            />
+          ) : browserMode === 'bookmarks' || activeTab.url === 'chrome://bookmarks' ? (
+            <BookmarksPage
+              bookmarks={bookmarks}
+              folders={folders}
+              onNavigate={handleNavigate}
+              onDeleteBookmark={(id) => setBookmarks(prev => prev.filter(b => b.id !== id))}
+              onAddBookmark={(title, url, folderId) => setBookmarks(prev => [{ id: `b-${Date.now()}`, title, url, folderId, dateAdded: Date.now() }, ...prev])}
+              onBackToBrowser={() => setBrowserMode('browser')}
+            />
+          ) : browserMode === 'downloads' || activeTab.url === 'chrome://downloads' ? (
+            <DownloadsPage
+              downloads={downloads}
+              onClearDownloads={() => setDownloads([])}
+              onBackToBrowser={() => setBrowserMode('browser')}
+            />
+          ) : browserMode === 'settings' || activeTab.url === 'chrome://settings' ? (
+            <SettingsPage onBackToBrowser={() => setBrowserMode('browser')} />
+          ) : browserMode === 'help' || activeTab.url === 'chrome://help' ? (
+            <HelpPage onBackToBrowser={() => setBrowserMode('browser')} />
+          ) : activeTab.url === 'chrome://newtab' ? (
+            <NewTabPage 
+              onNavigate={handleNavigate} 
+              isIncognito={activeTab.isIncognito || false} 
+              userProfile={userProfile}
+              onLogout={async () => {
+                setIsOnboardingComplete(false);
+                setUserProfile(null);
+                await supabase.from('settings').delete().in('key', ['onboardingComplete', 'userProfile', 'cloudflareAccountId', 'cloudflareApiKey', 'groqKey']);
+                if (isElectron) {
+                  await (window as any).electronAPI.clearData();
+                }
+              }}
+            />
+          ) : isElectron ? (
+            // In Electron mode, the native BrowserView renders on top — show nothing here.
+            // This prevents the React iframe fallback from interfering with the native renderer.
+            <div className="flex-1" />
+          ) : (
+            <BrowserContent
+              url={activeTab.url}
+              zoomLevel={activeTab.zoomLevel}
+              isIncognito={activeTab.isIncognito || false}
+              onNavigate={handleNavigate}
+            />
+          )}
+
+          {/* Chromium DevTools Panel Drawer */}
+          {showDevTools && (
+            <DevToolsPanel
+              currentUrl={activeTab.url}
+              onClose={() => setShowDevTools(false)}
+            />
+          )}
+        </div>
       </div>
 
-      {isVisualAnalyzing && (
-        <div className="absolute inset-0 bg-blue-500/20 z-[9999] flex items-center justify-center pointer-events-none transition-all duration-300">
-          <div className="bg-blue-600/90 text-white px-6 py-3 rounded-full font-semibold shadow-xl flex items-center space-x-3 backdrop-blur-sm border border-blue-400">
-             <svg className="w-5 h-5 animate-spin text-blue-100" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-             <span className="tracking-wide text-sm">Actra is analyzing the screen...</span>
-          </div>
-        </div>
-      )}
-
-      {/* AI Chat Panel (Floating) */}
-      {showAIPanel && !activeTab.isIncognito && (
-        <div
-          className="absolute right-4 bottom-4 z-50"
-          style={{ top: `${chromeHeight + 12}px` }}
-        >
-          <AIChat 
-            activeTabId={activeTabId} 
-            onClose={() => setShowAIPanel(false)} 
-            approvals={approvals}
-            setApprovals={setApprovals}
-          />
-        </div>
-      )}
-      
-      {/* Fallback for Cmd+K command bar shortcut - just opens the chat now */}
-      {showCommandBar && (
-        <div className="hidden">
-          {setTimeout(() => { setShowCommandBar(false); setShowAIPanel(true); }, 0)}
-        </div>
+      {isResizingSidebar && (
+        <div className="fixed inset-0 z-[999999] cursor-col-resize select-none" />
       )}
 
       {showVoiceBar && (

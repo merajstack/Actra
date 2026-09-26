@@ -1,9 +1,39 @@
 import React, { useEffect, useState, useRef } from 'react';
 import {
   X, Sparkles, CheckCircle2, AlertTriangle, Play, Loader2, Send, Mic,
-  User, Bot, ChevronUp, ChevronDown, CheckCheck, Pencil, Ban, Trash2, StopCircle, MailOpen, Calendar, Sheet, FileText, Search, Database, Zap, Maximize2, Minimize2
+  User, Bot, ChevronUp, ChevronDown, CheckCheck, Check, Pencil, Ban, Trash2, StopCircle, MailOpen, Calendar, Sheet, FileText, Search, Database, Zap, Maximize2, Minimize2, BookOpen, Cpu, Code2
 } from 'lucide-react';
 import { AITask, AIApprovalRequest, ChatSession, ChatMessage } from '../../types';
+
+// ─── MCQ Subject → Model map ─────────────────────────────────────────────────
+const MCQ_SUBJECTS = [
+  {
+    label: 'English / Verbal / General',
+    shortLabel: 'English / General',
+    model: '@cf/openai/gpt-oss-120b',
+    modelName: 'gpt-oss-120b',
+    icon: BookOpen,
+    description: 'Verbal reasoning, reading comprehension & general knowledge',
+  },
+  {
+    label: 'Aptitude / Maths / DSA',
+    shortLabel: 'Aptitude / Maths',
+    model: '@cf/qwen/qwq-32b',
+    modelName: 'qwq-32b',
+    icon: Cpu,
+    description: 'Deep mathematical reasoning, quantitative & DSA',
+  },
+  {
+    label: 'Coding / Web Dev',
+    shortLabel: 'Coding / Dev',
+    model: '@cf/qwen/qwen2.5-coder-32b-instruct',
+    modelName: 'qwen2.5-coder-32b',
+    icon: Code2,
+    description: 'Code synthesis, syntax, algorithms & debugging',
+  },
+] as const;
+
+type McqSubjectLabel = typeof MCQ_SUBJECTS[number]['label'];
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 const RISK_COLORS = ['text-emerald-600 bg-emerald-50 border-emerald-200',
@@ -21,9 +51,19 @@ function getActionIcon(name: string) {
   return <Zap className="w-4 h-4" />;
 }
 
+function sanitizeEmailPreview(value: string) {
+  return String(value || '')
+    .replace(/<\/?(script|style|iframe|object|embed|form)[^>]*>/gi, '')
+    .replace(/\s+on[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/javascript\s*:/gi, '')
+    .replace(/<meta[^>]*>/gi, '')
+    .replace(/<link[^>]*>/gi, '');
+}
+
 // ─── ApprovalCard ────────────────────────────────────────────────────────────
-const ApprovalCard: React.FC<any> = ({ approval, onApprove, onReject, onEdit }) => {
+const ApprovalCard: React.FC<any> = ({ approval, onApprove, onReject, onEdit, onEnhance }) => {
   const [isEditing, setIsEditing] = useState(false);
+  const [isEnhancing, setIsEnhancing] = useState(false);
   const [editedContent, setEditedContent] = useState(approval.generatedContent || '');
   const riskLevel = approval.riskLevel ?? 2;
 
@@ -38,6 +78,15 @@ const ApprovalCard: React.FC<any> = ({ approval, onApprove, onReject, onEdit }) 
       updates.content = editedContent;
     }
     onEdit(approval.id, updates);
+  };
+
+  const handleEnhance = async () => {
+    setIsEnhancing(true);
+    try {
+      await onEnhance(approval.id);
+    } finally {
+      setIsEnhancing(false);
+    }
   };
 
   return (
@@ -70,6 +119,17 @@ const ApprovalCard: React.FC<any> = ({ approval, onApprove, onReject, onEdit }) 
             )}
           </div>
         )}
+        {approval.htmlPreview && (
+          <div className="rounded-lg border border-zinc-200 overflow-hidden">
+            <div className="px-3 py-1.5 bg-zinc-50 border-b border-zinc-200">
+              <span className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wider">Rendered email preview</span>
+            </div>
+            <div
+              className="p-3 bg-white max-h-72 overflow-y-auto text-sm"
+              dangerouslySetInnerHTML={{ __html: sanitizeEmailPreview(approval.htmlPreview) }}
+            />
+          </div>
+        )}
         <div className="flex space-x-2 pt-1">
           {isEditing ? (
             <button onClick={handleEditSubmit} className="flex-1 flex items-center justify-center space-x-1.5 bg-orange-500 hover:bg-orange-600 text-white text-xs font-semibold py-2 rounded-lg transition-colors">
@@ -84,6 +144,16 @@ const ApprovalCard: React.FC<any> = ({ approval, onApprove, onReject, onEdit }) 
             <Ban className="w-3.5 h-3.5" /> <span>Reject</span>
           </button>
         </div>
+        {approval.action.name === 'send_email' && !approval.isHtmlRequest && (
+          <button
+            onClick={handleEnhance}
+            disabled={isEnhancing}
+            className="w-full flex items-center justify-center space-x-1.5 border border-orange-200 bg-orange-50 hover:bg-orange-100 disabled:opacity-60 text-orange-700 text-xs font-semibold py-2 rounded-lg transition-colors"
+          >
+            {isEnhancing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+            <span>{isEnhancing ? 'Enhancing email...' : 'Enhance with AI'}</span>
+          </button>
+        )}
       </div>
     </div>
   );
@@ -154,12 +224,44 @@ const TaskProgress: React.FC<{ taskId: string, tasks: AITask[], fallbackContent?
   );
 };
 
-export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({ onClose, activeTabId }) => {
-  const [isExpanded, setIsExpanded] = useState(false);
+export interface AIChatProps {
+  onClose: () => void;
+  activeTabId: string | null;
+  approvals?: AIApprovalRequest[];
+  setApprovals?: React.Dispatch<React.SetStateAction<AIApprovalRequest[]>>;
+  isExpanded?: boolean;
+  onToggleExpand?: () => void;
+}
+
+export const AIChat: React.FC<AIChatProps> = ({
+  onClose,
+  activeTabId,
+  approvals: propApprovals,
+  setApprovals: propSetApprovals,
+  isExpanded: controlledExpanded,
+  onToggleExpand,
+}) => {
+  const [internalExpanded, setInternalExpanded] = useState(false);
+  const isExpanded = controlledExpanded !== undefined ? controlledExpanded : internalExpanded;
+  const toggleExpand = onToggleExpand || (() => setInternalExpanded(prev => !prev));
+
   const [session, setSession] = useState<ChatSession | null>(null);
   const [input, setInput] = useState('');
   const [tasks, setTasks] = useState<AITask[]>([]);
-  const [approvals, setApprovals] = useState<AIApprovalRequest[]>([]);
+  const [localApprovals, setLocalApprovals] = useState<AIApprovalRequest[]>([]);
+
+  const approvals = propApprovals !== undefined ? propApprovals : localApprovals;
+  const setApprovals = propSetApprovals !== undefined ? propSetApprovals : setLocalApprovals;
+
+  // MCQ subject selector — persists for the session, user can change mid-quiz
+  const [mcqSubject, setMcqSubject] = useState<McqSubjectLabel>('English / Verbal / General');
+  const [isSubjectDropdownOpen, setIsSubjectDropdownOpen] = useState(false);
+  const subjectTriggerRef = useRef<HTMLButtonElement>(null);
+  const subjectDropdownRef = useRef<HTMLDivElement>(null);
+
+  const selectedSubjectObj = MCQ_SUBJECTS.find(s => s.label === mcqSubject) || MCQ_SUBJECTS[0];
+  const mcqModel = selectedSubjectObj.model;
+
   const [isRecording, setIsRecording] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
@@ -208,6 +310,27 @@ export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({
       });
       setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
     });
+    api.onAIApprovalUpdated((updatedApproval: AIApprovalRequest) => {
+      setApprovals(prev => prev.map(approval => approval.id === updatedApproval.id ? updatedApproval : approval));
+    });
+
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as Node;
+      const inTrigger = subjectTriggerRef.current?.contains(target);
+      const inDropdown = subjectDropdownRef.current?.contains(target);
+      if (!inTrigger && !inDropdown) {
+        setIsSubjectDropdownOpen(false);
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setIsSubjectDropdownOpen(false);
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
   }, []);
 
   const handleSend = async (e?: React.FormEvent) => {
@@ -227,7 +350,7 @@ export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({
       updatedAt: Date.now(),
     }));
     try {
-      await api.sendChatMessage(msg, activeTabId);
+      await api.sendChatMessage(msg, activeTabId, mcqModel);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setSession(prev => ({
@@ -271,6 +394,10 @@ export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({
   const handleEdit = (id: string, newArgs: Record<string, any>) => {
     api.editApproval(id, newArgs);
     setApprovals(prev => prev.filter(a => a.id !== id));
+  };
+  const handleEnhance = async (id: string) => {
+    const result = await api.enhanceApproval(id);
+    if (!result?.success) throw new Error(result?.error || 'Could not enhance email.');
   };
 
   const toggleRecording = async () => {
@@ -343,21 +470,35 @@ export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({
   };
 
   return (
-    <div className={`${isExpanded ? 'w-[600px]' : 'w-[420px]'} transition-all duration-300 h-full bg-white rounded-2xl border border-[#E8E2D5] flex flex-col shadow-[0_18px_60px_rgba(0,0,0,0.24)] z-[100000] overflow-hidden shrink-0`}>
+    <div className="w-full h-full bg-white flex flex-col overflow-hidden select-text">
       {/* Header */}
-      <div className="h-14 border-b border-[#E8E2D5] flex items-center justify-between px-5 shrink-0 bg-[#FDFBF7]">
-        <div className="flex items-center space-x-2 text-zinc-900 font-bold">
-          <Sparkles className="w-4 h-4 text-[#a04100]" />
+      <div className="h-12 border-b border-[#E8E2D5] flex items-center justify-between px-4 shrink-0 bg-[#FDFBF7]">
+        <div className="flex items-center space-x-2 text-zinc-900 font-semibold text-sm">
+          <div className="w-6 h-6 rounded-md bg-orange-500/10 flex items-center justify-center">
+            <Sparkles className="w-3.5 h-3.5 text-orange-600" />
+          </div>
           <span>Actra AI</span>
         </div>
-        <div className="flex space-x-1">
-          <button onClick={() => setIsExpanded(!isExpanded)} className="p-1.5 rounded-lg hover:bg-zinc-200 text-zinc-400 hover:text-zinc-600 cursor-pointer transition-colors" title={isExpanded ? "Minimize" : "Expand"}>
+        <div className="flex space-x-1 items-center">
+          <button 
+            onClick={toggleExpand} 
+            className="p-1.5 rounded-lg hover:bg-zinc-200/70 text-zinc-400 hover:text-zinc-600 cursor-pointer transition-colors" 
+            title={isExpanded ? "Collapse Sidebar" : "Expand Sidebar"}
+          >
             {isExpanded ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
           </button>
-          <button onClick={handleClear} className="p-1.5 rounded-lg hover:bg-zinc-200 text-zinc-400 hover:text-red-500 cursor-pointer transition-colors" title="Clear Chat">
+          <button 
+            onClick={handleClear} 
+            className="p-1.5 rounded-lg hover:bg-zinc-200/70 text-zinc-400 hover:text-red-500 cursor-pointer transition-colors" 
+            title="Clear Chat"
+          >
             <Trash2 className="w-4 h-4" />
           </button>
-          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-zinc-200 text-zinc-500 cursor-pointer transition-colors">
+          <button 
+            onClick={onClose} 
+            className="p-1.5 rounded-lg hover:bg-zinc-200/70 text-zinc-400 hover:text-zinc-700 cursor-pointer transition-colors" 
+            title="Close Sidebar"
+          >
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -403,6 +544,7 @@ export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({
                         onApprove={handleApprove}
                         onReject={handleReject}
                         onEdit={handleEdit}
+                        onEnhance={handleEnhance}
                       />
                     ))}
                   </div>
@@ -469,6 +611,7 @@ export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({
                   onApprove={handleApprove}
                   onReject={handleReject}
                   onEdit={handleEdit}
+                  onEnhance={handleEnhance}
                 />
               ))}
             </div>
@@ -479,7 +622,90 @@ export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({
       </div>
 
       {/* Input */}
-      <div className="p-4 border-t border-[#E8E2D5] bg-[#FDFBF7]">
+      <div className="shrink-0 p-3 border-t border-[#E8E2D5] bg-[#FDFBF7] relative">
+        {/* Antigravity-style Model/Subject Selector Pill */}
+        <div className="relative mb-2">
+          <div className="flex items-center justify-between px-0.5">
+            <button
+              id="mcq-subject-dropdown-trigger"
+              ref={subjectTriggerRef}
+              type="button"
+              onClick={() => setIsSubjectDropdownOpen(prev => !prev)}
+              className="flex items-center gap-2 px-2.5 py-1.5 text-xs font-medium text-zinc-700 bg-white hover:bg-zinc-50 border border-zinc-200/90 rounded-lg shadow-sm hover:border-zinc-300 transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-orange-500/20 group max-w-full"
+              title="Click to switch MCQ / quiz solver model"
+            >
+              <div className="w-4 h-4 rounded flex items-center justify-center bg-orange-50 text-orange-600 group-hover:bg-orange-100 transition-colors shrink-0">
+                {React.createElement(selectedSubjectObj.icon, { className: 'w-3 h-3' })}
+              </div>
+              <span className="text-zinc-800 font-medium truncate">{selectedSubjectObj.shortLabel}</span>
+              <span className="text-[10px] text-zinc-500 font-mono bg-zinc-100 px-1.5 py-0.5 rounded border border-zinc-200/60 shrink-0">
+                {selectedSubjectObj.modelName}
+              </span>
+              <ChevronDown className={`w-3.5 h-3.5 shrink-0 text-zinc-400 transition-transform duration-200 ${isSubjectDropdownOpen ? 'rotate-180 text-orange-500' : ''}`} />
+            </button>
+            <span className="text-[10px] text-zinc-400 font-medium ml-2 shrink-0">Subject-tuned solver</span>
+          </div>
+
+          {/* Antigravity-style Model Dropdown Menu */}
+          {isSubjectDropdownOpen && (
+            <div
+              ref={subjectDropdownRef}
+              className="absolute bottom-full mb-2 left-0 z-50 w-72 bg-white rounded-xl shadow-2xl border border-zinc-200 py-1.5"
+            >
+              <div className="px-3 py-1.5 border-b border-zinc-100 flex items-center justify-between">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
+                  Quiz / MCQ Model
+                </span>
+                <span className="text-[10px] text-zinc-400 font-medium">Subject Specialized</span>
+              </div>
+              <div className="p-1 space-y-1">
+                {MCQ_SUBJECTS.map((item) => {
+                  const isSelected = item.label === mcqSubject;
+                  const ItemIcon = item.icon;
+                  return (
+                    <button
+                      key={item.model}
+                      type="button"
+                      onClick={() => {
+                        setMcqSubject(item.label as McqSubjectLabel);
+                        setIsSubjectDropdownOpen(false);
+                      }}
+                      className={`w-full text-left px-2.5 py-2.5 rounded-lg flex items-start gap-2.5 transition-all cursor-pointer ${
+                        isSelected
+                          ? 'bg-orange-50 border border-orange-200'
+                          : 'hover:bg-zinc-50 border border-transparent'
+                      }`}
+                    >
+                      <div className={`mt-0.5 p-1.5 rounded-md shrink-0 ${
+                        isSelected ? 'bg-orange-500 text-white' : 'bg-zinc-100 text-zinc-500'
+                      }`}>
+                        <ItemIcon className="w-3.5 h-3.5" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center justify-between gap-1">
+                          <span className={`text-xs font-medium ${isSelected ? 'text-orange-900 font-semibold' : 'text-zinc-800'}`}>
+                            {item.label}
+                          </span>
+                          {isSelected && <Check className="w-3.5 h-3.5 text-orange-600 shrink-0" />}
+                        </div>
+                        <div className="flex items-center gap-1.5 mt-0.5">
+                          <span className="text-[10px] font-mono text-zinc-600 bg-zinc-100 px-1.5 py-0.5 rounded">
+                            {item.modelName}
+                          </span>
+                          <span className="text-[10px] text-zinc-400 truncate">
+                            {item.description}
+                          </span>
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Text Input Bar */}
         <form onSubmit={handleSend} className="relative flex items-center">
           <input
             ref={inputRef}
@@ -492,39 +718,39 @@ export const AIChat: React.FC<{ onClose: () => void, activeTabId: string }> = ({
           />
           <div className="absolute right-2 flex space-x-1 items-center">
             {tasks.some(t => !['completed', 'failed', 'cancelled', 'rejected'].includes(t.status)) ? (
+              <button
+                type="button"
+                onClick={() => {
+                  const activeTask = tasks.find(t => !['completed', 'failed', 'cancelled', 'rejected'].includes(t.status));
+                  if (activeTask) api.cancelTask(activeTask.id);
+                }}
+                className="p-1.5 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors cursor-pointer"
+                title="Terminate Action"
+              >
+                <StopCircle className="w-4 h-4" />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!input.trim() && !isRecording}
+                className="p-1.5 bg-orange-500 text-white rounded-lg hover:bg-orange-600 disabled:bg-zinc-200 disabled:text-zinc-400 transition-colors cursor-pointer"
+              >
+                <Send className="w-4 h-4" />
+              </button>
+            )}
             <button
               type="button"
-              onClick={() => {
-                const activeTask = tasks.find(t => !['completed', 'failed', 'cancelled', 'rejected'].includes(t.status));
-                if (activeTask) api.cancelTask(activeTask.id);
-              }}
-              className="p-1.5 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors cursor-pointer"
-              title="Terminate Action"
+              onClick={toggleRecording}
+              className={`p-1.5 rounded-lg transition-colors cursor-pointer ${isRecording ? 'bg-red-500 text-white animate-pulse' : 'bg-zinc-100 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-700'}`}
+              title={isRecording ? "Stop Dictation" : "Start Dictation"}
             >
-              <StopCircle className="w-4 h-4" />
+              <Mic className="w-4 h-4" />
             </button>
-          ) : (
-            <button
-              type="submit"
-              disabled={!input.trim() && !isRecording}
-              className="p-1.5 bg-orange-500 text-white rounded-lg hover:bg-orange-600 disabled:bg-zinc-200 disabled:text-zinc-400 transition-colors cursor-pointer"
-            >
-              <Send className="w-4 h-4" />
-            </button>
-          )}
-          <button
-            type="button"
-            onClick={toggleRecording}
-            className={`p-1.5 rounded-lg transition-colors cursor-pointer ${isRecording ? 'bg-red-500 text-white animate-pulse' : 'bg-zinc-100 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-700'}`}
-            title={isRecording ? "Stop Dictation" : "Start Dictation"}
-          >
-            <Mic className="w-4 h-4" />
-          </button>
+          </div>
+        </form>
+        <div className="text-center mt-1.5">
+          <span className="text-[10px] text-zinc-400">AI can make mistakes. Verify before approving.</span>
         </div>
-      </form>
-      <div className="text-center mt-2">
-        <span className="text-[10px] text-zinc-400">AI can make mistakes. Verify before approving.</span>
-      </div>
       </div>
     </div>
   );

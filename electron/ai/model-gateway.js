@@ -14,6 +14,24 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../../.env') });
 const supabase = require('../supabase');
 
+// ─── Model Registry ─────────────────────────────────────────────────────────
+// To swap any model: change one line here. Nothing else in the codebase needs updating.
+const MODELS = {
+  // Fast 70B — everyday chat, Gmail summarization, page extraction
+  chat:    '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+  // Dedicated reasoning — multi-step agentic plans, tool selection, complex tasks
+  planner: '@cf/qwen/qwq-32b',
+  // Best-in-class coding — code gen, debug, GitHub README, technical Q&A
+  coding:  '@cf/qwen/qwen2.5-coder-32b-instruct',
+  // Multimodal MoE — screenshot analysis, MCQ solving, UI-TARS visual_interact
+  vision:  '@cf/meta/llama-4-scout-17b-16e-instruct',
+};
+
+// Auto-detection patterns (used when caller passes role: 'auto' or omits role)
+const CODING_PATTERN  = /\b(code|function|class|debug|fix (the )?(bug|error|issue)|write (a |the )?(script|program|function)|refactor|sql|regex|algorithm|typescript|javascript|python|rust|golang|java|c\+\+|html|css|bash|shell)\b/i;
+const VISION_PATTERN  = /\b(screenshot|image|picture|photo|visual|mcq|question|option|select|click|what('?s| is) (on|in) (the |this )?(screen|image|page)|analyze (this|the) (image|screenshot|page))\b/i;
+const PLANNER_PATTERN = /\b(plan|step|steps|how (do|can|should) i|workflow|automate|agent|task|execute|sequence|first.*then|open.*and.*then|do (the )?following)\b/i;
+
 const CLOUDFLARE_INVALID_ACCOUNT_MESSAGE = 'Invalid key/account id, please check and replace them in settings.';
 const ACTRA_AI_DAILY_LIMIT_MESSAGE = 'Actra AI daily limit finished, it resets at 00:00';
 const CLOUDFLARE_GENERIC_MESSAGE = 'Cloudflare request failed. Please try again later.';
@@ -79,44 +97,103 @@ function getCloudflareUserMessage(status, body) {
     return { message: CLOUDFLARE_INVALID_ACCOUNT_MESSAGE, code: 'CLOUDFLARE_INVALID_ACCOUNT' };
   }
 
+  if (text) {
+    // Return clean descriptive message from Cloudflare
+    return { message: `Cloudflare AI Error: ${readCloudflareErrorText(body)}`, code: 'CLOUDFLARE_API_ERROR' };
+  }
+
   return { message: CLOUDFLARE_GENERIC_MESSAGE, code: 'CLOUDFLARE_REQUEST_FAILED' };
 }
 
 class ModelGateway {
   constructor() {
-    this.defaultModel = 'llama-3.1-8b-instant'; // fast default
-    this.reasoningModel = 'llama-3.3-70b-versatile'; // powerful model
-    this.baseUrl = 'https://api.groq.com/openai/v1/chat/completions';
-    this.modelsUrl = 'https://api.groq.com/openai/v1/models';
-    
-    this.totalTokensUsed = 0;
-    this.tokenBudget = Infinity;
+    // Legacy Groq defaults — only used when Cloudflare is not configured
+    this.defaultModel   = 'llama-3.1-8b-instant';
+    this.reasoningModel = 'llama-3.1-70b-versatile';
+    this.baseUrl        = 'https://api.groq.com/openai/v1/chat/completions';
+    this.modelsUrl      = 'https://api.groq.com/openai/v1/models';
 
+    this.totalTokensUsed = 0;
+    this.tokenBudget     = Infinity;
     this.availableModels = null;
-    this.fetchingModels = null;
+    this.fetchingModels  = null;
+  }
+
+  /**
+   * Resolve the correct Cloudflare model for a given role.
+   * Falls back to auto-detecting from prompt content when role is 'auto'.
+   * Callers can also pass options.model to hard-pin a specific model ID.
+   *
+   * @param {string} role  'chat' | 'planner' | 'coding' | 'vision' | 'auto'
+   * @param {string} [promptHint]  Optional prompt text for auto-detection
+   * @returns {string} Cloudflare model ID
+   */
+  resolveRole(role, promptHint = '') {
+    // Hard-pinned model ID from caller
+    if (role && role.startsWith('@cf/')) return role;
+    // Named role from registry
+    if (role && MODELS[role]) {
+      console.log(`[ModelGateway] Role: "${role}" → ${MODELS[role]}`);
+      return MODELS[role];
+    }
+    // Auto-detect from prompt content
+    if (!role || role === 'auto') {
+      if (VISION_PATTERN.test(promptHint))  { console.log('[ModelGateway] Auto-role: vision');  return MODELS.vision; }
+      if (CODING_PATTERN.test(promptHint))  { console.log('[ModelGateway] Auto-role: coding');  return MODELS.coding; }
+      if (PLANNER_PATTERN.test(promptHint)) { console.log('[ModelGateway] Auto-role: planner'); return MODELS.planner; }
+      console.log('[ModelGateway] Auto-role: chat (default)');
+      return MODELS.chat;
+    }
+    console.warn(`[ModelGateway] Unknown role "${role}", falling back to chat model`);
+    return MODELS.chat;
+  }
+
+  async getCloudflareCredentials() {
+    let accountId = null;
+    let apiToken = null;
+
+    try {
+      const { default: Store } = await import('electron-store');
+      const localStore = new Store({ name: 'config', projectName: 'Actra' });
+      const storeAcc = localStore.get('cloudflareAccountId');
+      const storeKey = localStore.get('cloudflareApiKey');
+      if (storeAcc && typeof storeAcc === 'string' && storeAcc.trim().length > 5) accountId = storeAcc.trim();
+      if (storeKey && typeof storeKey === 'string' && storeKey.trim().length > 5) apiToken = storeKey.trim();
+    } catch (e) {}
+
+    if (!accountId || !apiToken) {
+      try {
+        const { data: accData } = await supabase.from('settings').select('value').eq('key', 'cloudflareAccountId').single();
+        const { data: keyData } = await supabase.from('settings').select('value').eq('key', 'cloudflareApiKey').single();
+        if (accData?.value && typeof accData.value === 'string' && accData.value.trim().length > 5) accountId = accData.value.trim();
+        if (keyData?.value && typeof keyData.value === 'string' && keyData.value.trim().length > 5) apiToken = keyData.value.trim();
+      } catch (e) {}
+    }
+
+    return { accountId, apiToken };
   }
 
   async getApiKey() {
     try {
       const { default: Store } = await import('electron-store');
       const localKey = new Store({ name: 'config', projectName: 'Actra' }).get('groqKey');
-      if (localKey) return localKey;
+      if (localKey && typeof localKey === 'string' && localKey.trim().length > 5) return localKey.trim();
     } catch (e) {}
     try {
       const { data } = await supabase.from('settings').select('value').eq('key', 'groqKey').single();
-      if (data?.value) return data.value;
+      if (data?.value && typeof data.value === 'string' && data.value.trim().length > 5) return data.value.trim();
     } catch (e) {}
-    return process.env.GROQ_API_KEY;
+    return null;
   }
 
   isAvailable() {
-    return true; // Cloudflare gpt-oss-120b is always available as first priority
+    return true;
   }
 
   async _fetchGroq(payload) {
     const key = await this.getApiKey();
-    if (!key || key === 'YOUR_GROQ_API_KEY') {
-      throw new Error('Groq API Key is not configured. Please set GROQ_API_KEY in .env or via onboarding.');
+    if (!key) {
+      throw new Error('Groq API Key is not configured. Please enter your Groq API Key in Settings (chrome://settings).');
     }
     
     const controller = new AbortController();
@@ -230,130 +307,132 @@ class ModelGateway {
 
   async _fetchWithFallback(payload, isReasoning = false) {
     payload = this._compactPayload(payload);
-    try {
-      console.log(`[ModelGateway] Attempting Cloudflare AI: gpt-oss-120b`);
-      
-      let cfAccountId;
-      let cfApiToken;
+    
+    const { accountId: cfAccountId, apiToken: cfApiToken } = await this.getCloudflareCredentials();
+    const groqKey = await this.getApiKey();
 
+    if (!cfAccountId && !cfApiToken && !groqKey) {
+      throw new Error('AI credentials not configured. Please set your Groq API Key in Settings (chrome://settings).');
+    }
+
+    // ── Cloudflare path: only attempt if BOTH account ID and API token are present ──
+    if (cfAccountId && cfApiToken) {
       try {
-        const { default: Store } = await import('electron-store');
-        const localStore = new Store({ name: 'config', projectName: 'Actra' });
-        cfAccountId = localStore.get('cloudflareAccountId');
-        cfApiToken = localStore.get('cloudflareApiKey');
-      } catch (e) {}
+        const model = payload.model;
+        console.log(`[ModelGateway] Cloudflare → ${model} (account: ${cfAccountId.slice(0,8)}…)`);
+        const url = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/ai/v1/chat/completions`;
+        
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 60000);
 
-      if (!cfAccountId || !cfApiToken) {
-        throw createCloudflareUserError(CLOUDFLARE_INVALID_ACCOUNT_MESSAGE, 'CLOUDFLARE_INVALID_ACCOUNT');
-      }
+        const cfPayload = { ...payload }; // model already set by caller
 
-      // Use OpenAI-compatible endpoint for better tool calling support
-      const url = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/ai/v1/chat/completions`;
-      
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s timeout
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${cfApiToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(cfPayload),
+          signal: controller.signal
+        });
 
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${cfApiToken}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal
-      });
+        clearTimeout(timeoutId);
 
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        const { message, code } = getCloudflareUserMessage(response.status, errorText);
-        throw createCloudflareUserError(message, code);
-      }
-
-      const cfData = await response.json();
-      
-      const isNativeOpenAI = cfData.choices !== undefined;
-      if (!isNativeOpenAI && !cfData.success) {
-        const { message, code } = getCloudflareUserMessage(response.status, cfData);
-        throw createCloudflareUserError(message, code);
-      }
-      
-      console.log(`[ModelGateway] Cloudflare request succeeded!`);
-      
-      if (isNativeOpenAI) {
-        // Mock cfData.result to use our new parser
-        cfData.result = cfData;
-      }
-      
-      // Map Cloudflare's response to OpenAI format so the rest of the app works
-      let textContent = '';
-      let toolCalls = null;
-      
-      console.log(`[ModelGateway] cfData.result:`, JSON.stringify(cfData.result).slice(0, 500));
-
-      if (cfData.result) {
-        if (typeof cfData.result === 'string') {
-          textContent = cfData.result;
-        } else if (cfData.result.response !== undefined) {
-          textContent = cfData.result.response;
-        } else if (cfData.result.choices && cfData.result.choices[0]?.message) {
-          textContent = cfData.result.choices[0].message.content || '';
-          if (cfData.result.choices[0].message.tool_calls) {
-            toolCalls = cfData.result.choices[0].message.tool_calls;
-          }
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error(`[ModelGateway] Cloudflare HTTP ${response.status}: ${errorText.slice(0, 300)}`);
+          const { message, code } = getCloudflareUserMessage(response.status, errorText);
+          throw createCloudflareUserError(message, code);
         }
-      }
-      
-      // If the model output a tool call natively in the CF result format
-      if (!toolCalls && cfData.result && cfData.result.tool_calls) {
-        toolCalls = cfData.result.tool_calls;
-      }
 
-      const data = {
-        choices: [
-          {
-            message: {
-              content: textContent,
-              ...(toolCalls ? { tool_calls: toolCalls } : {})
+        const cfData = await response.json();
+        
+        const isNativeOpenAI = cfData.choices !== undefined;
+        if (!isNativeOpenAI && !cfData.success) {
+          const { message, code } = getCloudflareUserMessage(response.status, cfData);
+          throw createCloudflareUserError(message, code);
+        }
+        
+        console.log(`[ModelGateway] Cloudflare request succeeded!`);
+        
+        if (isNativeOpenAI) {
+          cfData.result = cfData;
+        }
+        
+        let textContent = '';
+        let toolCalls = null;
+
+        if (cfData.result) {
+          if (typeof cfData.result === 'string') {
+            textContent = cfData.result;
+          } else if (cfData.result.response !== undefined) {
+            textContent = cfData.result.response;
+          } else if (cfData.result.choices && cfData.result.choices[0]?.message) {
+            textContent = cfData.result.choices[0].message.content || '';
+            if (cfData.result.choices[0].message.tool_calls) {
+              toolCalls = cfData.result.choices[0].message.tool_calls;
             }
           }
-        ],
-        usage: { total_tokens: 0 }
-      };
+        }
+        
+        if (!toolCalls && cfData.result && cfData.result.tool_calls) {
+          toolCalls = cfData.result.tool_calls;
+        }
 
-      const tokens = 0;
-      return { data, tokensUsed: tokens };
+        const data = {
+          choices: [{ message: { content: textContent, ...(toolCalls ? { tool_calls: toolCalls } : {}) } }],
+          usage: { total_tokens: 0 }
+        };
 
-    } catch (cfError) {
-      if (cfError.name === 'AbortError') {
-        cfError = createCloudflareUserError('Cloudflare request timed out. Please try again.', 'CLOUDFLARE_TIMEOUT');
+        return { data, tokensUsed: 0 };
+
+      } catch (rawCfError) {
+        // Use `let` so we can replace the raw AbortError with a typed user error.
+        let cfError = rawCfError;
+        if (cfError.name === 'AbortError') {
+          cfError = createCloudflareUserError('Cloudflare request timed out.', 'CLOUDFLARE_TIMEOUT');
+        }
+
+        if (groqKey) {
+          // Groq is available — fall through silently; never surface CF noise to the user.
+          console.warn(`[ModelGateway] Cloudflare failed (${cfError.message}). Falling back to Groq.`);
+        } else {
+          // No fallback — surface the most actionable error we can.
+          console.error(`[ModelGateway] Cloudflare failed with no Groq fallback: ${cfError.message}`);
+          throw cfError.isCloudflareUserError
+            ? cfError
+            : createCloudflareUserError(CLOUDFLARE_GENERIC_MESSAGE, 'CLOUDFLARE_REQUEST_FAILED');
+        }
       }
-
-      console.error(`[ModelGateway] Cloudflare failed: ${cfError.isCloudflareUserError ? cfError.message : CLOUDFLARE_GENERIC_MESSAGE}.`);
-
-      if (cfError.code === 'CLOUDFLARE_INVALID_ACCOUNT' || cfError.code === 'ACTRA_AI_DAILY_LIMIT') {
-        throw cfError;
-      }
-      
-      const key = await this.getApiKey();
-      if (!key || key === 'YOUR_GROQ_API_KEY') {
-        throw cfError.isCloudflareUserError ? cfError : createCloudflareUserError(CLOUDFLARE_GENERIC_MESSAGE, 'CLOUDFLARE_REQUEST_FAILED');
-      }
-      
-      console.log('Falling back to Groq...');
-      let groqModel = payload.model;
-      if (groqModel === '@cf/openai/gpt-oss-120b' || !this.availableModels || !this.availableModels.includes(groqModel)) {
-        groqModel = await this.resolveModel(isReasoning ? this.reasoningModel : this.defaultModel, isReasoning);
-      }
-      
-      const groqPayload = {
-        ...payload,
-        model: groqModel
-      };
-
-      return await this._fetchGroq(groqPayload);
     }
+
+    // ── Groq path (primary if no CF keys, fallback if CF failed) ──
+    if (!groqKey) {
+      throw new Error('No AI credentials configured. Please add your Groq API Key in Settings (chrome://settings).');
+    }
+
+    // Map CF model role back to a valid Groq model
+    const resolvedGroqModel = await this._cfModelToGroq(payload.model);
+    console.log(`[ModelGateway] Groq fallback → ${resolvedGroqModel}`);
+    return await this._fetchGroq({ ...payload, model: resolvedGroqModel });
+  }
+
+  /**
+   * Map a Cloudflare model ID to the closest available Groq model.
+   * @param {string} cfModel
+   */
+  async _cfModelToGroq(cfModel) {
+    await this._ensureModels();
+    const models = this.availableModels || [];
+    const textModels = models.filter(m =>
+      !m.includes('whisper') && !m.includes('audio') && !m.includes('guard') &&
+      !m.includes('speech')  && !m.includes('embedding')
+    );
+    if (cfModel === MODELS.planner || cfModel === MODELS.coding) {
+      return textModels.find(m => m.includes('70b') || m.includes('120b')) || this.reasoningModel;
+    }
+    return textModels.find(m => m.includes('8b') || m.includes('instant')) || this.defaultModel;
   }
 
   async _ensureModels() {
@@ -415,70 +494,91 @@ class ModelGateway {
     }
     
     // Fallback to anything
-    return textModels.find(m => m.includes('llama')) || textModels.find(m => m.includes('gpt-oss-120b')) || textModels[0];
+    return textModels.find(m => m.includes('llama')) || textModels.find(m => m.includes('qwen')) || textModels[0];
   }
 
   /**
-   * Simple chat completion.
+   * Conversational completion.
+   * @param {Array}  messages
+   * @param {object} options
+   * @param {string} [options.role]              'chat' | 'planner' | 'coding' | 'vision' | 'auto'
+   * @param {string} [options.model]             Hard-pin a specific model ID (overrides role)
+   * @param {string} [options.systemInstruction]
+   * @param {number} [options.temperature]
+   * @param {number} [options.maxTokens]
    */
   async chat(messages, options = {}) {
+    const promptHint = messages.map(m => typeof m.content === 'string' ? m.content : '').join(' ');
+    const model      = options.model || this.resolveRole(options.role || 'auto', promptHint);
     const sysMsg = options.systemInstruction ? [{ role: 'system', content: options.systemInstruction }] : [];
     
     const payload = {
-      model: options.model || '@cf/openai/gpt-oss-120b',
-      messages: [...sysMsg, ...messages],
+      model,
+      messages:    [...sysMsg, ...messages],
       temperature: options.temperature ?? 0.7,
-      max_tokens: options.maxTokens ?? 1024,
+      max_tokens:  options.maxTokens   ?? 1024,
     };
 
     const { data, tokensUsed } = await this._fetchWithFallback(payload, false);
-    return { text: data.choices[0]?.message?.content || '', tokensUsed };
+    const rawText = data.choices[0]?.message?.content || '';
+    return { text: this._stripReasoning(rawText), tokensUsed };
   }
 
   /**
-   * Chat with function calling / tool use.
+   * Tool / function calling.
+   * @param {Array}  messages
+   * @param {Array}  tools
+   * @param {object} options
+   * @param {string} [options.role]  Defaults to 'planner' — best for function calling + reasoning
    */
   async toolCall(messages, tools, options = {}) {
+    const promptHint = messages.map(m => typeof m.content === 'string' ? m.content : '').join(' ');
+    // Planner is default for tool calls — has native function calling + step reasoning
+    const model  = options.model || this.resolveRole(options.role || 'planner', promptHint);
     const sysMsg = options.systemInstruction ? [{ role: 'system', content: options.systemInstruction }] : [];
 
     const groqTools = tools.map(t => ({
       type: 'function',
       function: {
-        name: t.name,
+        name:        t.name,
         description: t.description,
-        parameters: t.parameters || { type: 'object', properties: {} }
+        parameters:  t.parameters || { type: 'object', properties: {} }
       }
     }));
 
     const payload = {
-      model: options.model || '@cf/openai/gpt-oss-120b',
-      messages: [...sysMsg, ...messages],
-      tools: groqTools,
+      model,
+      messages:    [...sysMsg, ...messages],
+      tools:       groqTools,
       tool_choice: 'auto',
       temperature: options.temperature ?? 0.3,
     };
 
-    const { data, tokensUsed } = await this._fetchWithFallback(payload, true);
+    const { data, tokensUsed } = await this._fetchWithFallback(payload, false);
     const message = data.choices[0]?.message;
 
     if (message?.tool_calls?.length > 0) {
       const toolCalls = message.tool_calls.map(tc => {
         let args = {};
-        try {
-          args = JSON.parse(tc.function.arguments);
-        } catch(e) {}
+        try { args = JSON.parse(tc.function.arguments); } catch(e) {}
         return { name: tc.function.name, args };
       });
       return { toolCalls, tokensUsed };
     }
 
-    return { text: message?.content || '', tokensUsed };
+    const rawText = message?.content || '';
+    return { text: this._stripReasoning(rawText), tokensUsed };
   }
 
   /**
-   * Get structured JSON output.
+   * Structured JSON output extraction.
+   * @param {string} prompt
+   * @param {object} schema   JSON Schema object
+   * @param {object} options
+   * @param {string} [options.role]  Defaults to 'planner' — best for structured reasoning
    */
   async structuredOutput(prompt, schema, options = {}) {
+    const model = options.model || this.resolveRole(options.role || 'planner', prompt);
     // Groq requires JSON output instruction in the prompt
     const sysMsg = [{ 
       role: 'system', 
@@ -486,20 +586,22 @@ class ModelGateway {
     }];
 
     const payload = {
-      model: options.model || '@cf/openai/gpt-oss-120b',
+      model,
       messages: [...sysMsg, { role: 'user', content: prompt }],
       response_format: { type: 'json_object' },
       temperature: options.temperature ?? 0.1,
     };
 
-    const { data, tokensUsed } = await this._fetchWithFallback(payload, true);
-    const text = data.choices[0]?.message?.content || '{}';
+    const { data, tokensUsed } = await this._fetchWithFallback(payload, false);
+    let text = data.choices[0]?.message?.content || '{}';
     let parsedData;
     
     if (typeof text !== 'string') {
       // Cloudflare sometimes auto-parses JSON responses natively.
       parsedData = text;
     } else {
+      // Strip reasoning blocks BEFORE any JSON parsing attempt
+      text = this._stripReasoning(text);
       let cleanedText = text.replace(/```json/gi, '').replace(/```/g, '').trim();
       try {
         parsedData = JSON.parse(cleanedText);
@@ -521,6 +623,52 @@ class ModelGateway {
     return { data: parsedData, tokensUsed };
   }
 
+  /**
+   * Vision inference — sends a screenshot + text prompt to the vision model.
+   * Used by visual_interact in BrowserAgent (MCQ solving, UI-TARS).
+   *
+   * @param {string} base64Image  data:image/... base64 string
+   * @param {string} textPrompt   What to ask about the image
+   * @param {object} [options]
+   */
+  async visionChat(base64Image, textPrompt, options = {}) {
+    const { accountId: cfAccountId, apiToken: cfApiToken } = await this.getCloudflareCredentials();
+    if (!cfAccountId || !cfApiToken) {
+      throw new Error('Vision requires Cloudflare credentials. Please configure them in Settings (chrome://settings).');
+    }
+    // Guard: ensure text-only models are never sent image payloads
+    const textOnlyModels = [
+      '@cf/qwen/qwq-32b',
+      '@cf/qwen/qwen2.5-coder-32b-instruct',
+      '@cf/openai/gpt-oss-120b',
+      MODELS.chat,
+      MODELS.planner,
+      MODELS.coding,
+    ];
+    let targetModel = options.model || MODELS.vision;
+    if (textOnlyModels.includes(targetModel)) {
+      console.warn(`[ModelGateway] visionChat received text-only model "${targetModel}" — falling back to multimodal model "${MODELS.vision}".`);
+      targetModel = MODELS.vision;
+    }
+
+    const payload = {
+      model: targetModel,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text',      text: textPrompt },
+          { type: 'image_url', image_url: { url: base64Image } },
+        ],
+      }],
+      temperature: options.temperature ?? 0.1,
+      max_tokens:  options.maxTokens   ?? 512,
+    };
+    // hasImages = true → skip compaction so base64 data is preserved
+    const { data, tokensUsed } = await this._fetchWithFallback(payload, true);
+    const rawText = data.choices[0]?.message?.content || '';
+    return { text: this._stripReasoning(rawText), tokensUsed };
+  }
+
   // Budget
   setTokenBudget(budget) { this.tokenBudget = budget; }
   getTokensUsed() { return this.totalTokensUsed; }
@@ -530,6 +678,27 @@ class ModelGateway {
     if (this.totalTokensUsed >= this.tokenBudget) {
       console.warn(`[ModelGateway] Token budget exceeded: ${this.totalTokensUsed}/${this.tokenBudget}`);
     }
+  }
+
+  _stripReasoning(text) {
+    if (typeof text !== 'string') return text;
+    // 1. Remove complete <think>...</think> blocks
+    let cleaned = text.replace(/<think>[\s\S]*?<\/think>\n?/gi, '');
+    
+    // 2. Handle missing opening <think> tag (model just outputs thoughts then </think>)
+    if (cleaned.includes('</think>')) {
+      cleaned = cleaned.split('</think>').pop();
+    }
+    
+    // 3. Handle missing closing </think> tag (model ran out of tokens before finishing thoughts)
+    if (cleaned.includes('<think>')) {
+      cleaned = cleaned.split('<think>')[0];
+    }
+    
+    // Also remove markdown <think> blocks if the model wrapped it in codeblocks
+    cleaned = cleaned.replace(/```[a-z]*\n<think>[\s\S]*?<\/think>\n```\n?/gi, '');
+    
+    return cleaned.trim();
   }
 }
 

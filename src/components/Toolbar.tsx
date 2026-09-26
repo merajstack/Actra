@@ -4,6 +4,7 @@ import {
   Download, Settings, Menu, Search, Globe, X, FileText, Sparkles, Plus, LogOut
 } from 'lucide-react';
 import { Bookmark, DownloadItem, HistoryItem } from '../types';
+import { ActraLoader } from './ActraLoader';
 
 interface ToolbarProps {
   url: string;
@@ -63,6 +64,17 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   useEffect(() => {
     setInputValue(url);
   }, [url]);
+
+  // ── BrowserView z-order fix ────────────────────────────────────────────────
+  // Electron's BrowserView is a native OS surface that always renders ABOVE
+  // all React DOM elements — no z-index can fix this. The only solution is to
+  // hide the BrowserView while any React overlay is visible, then restore it.
+  const anyOverlayOpen = showMenu || showSuggestions || showDownloadsPopover || showSiteInfo;
+  useEffect(() => {
+    window.dispatchEvent(
+      new CustomEvent('toolbar-overlay-change', { detail: { open: anyOverlayOpen } })
+    );
+  }, [anyOverlayOpen]);
 
   // Filter history and bookmarks for omnibox autocomplete
   const suggestions = React.useMemo(() => {
@@ -140,7 +152,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           className="p-1.5 rounded-lg hover:bg-zinc-200/70 dark:hover:bg-zinc-800 transition-colors cursor-pointer text-zinc-700 dark:text-zinc-200"
           title="Reload (Cmd+R)"
         >
-          <RotateCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-orange-500' : ''}`} />
+          {isLoading ? <ActraLoader size="sm" label="Reloading" /> : <RotateCw className="w-4 h-4" />}
         </button>
         <button
           onClick={onHome}

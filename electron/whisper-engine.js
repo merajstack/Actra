@@ -1,16 +1,26 @@
-/**
- * Whisper Engine - Runs Whisper speech-to-text.
- * Uses Groq API (whisper-large-v3-turbo) for instant, highly accurate transcription.
- */
-require('dotenv').config();
+const supabase = require('./supabase');
 
 let isLoading = false;
 let isReady = true;
 
+async function getGroqApiKey() {
+  try {
+    const { default: Store } = await import('electron-store');
+    const localStore = new Store({ name: 'config', projectName: 'Actra' });
+    const localKey = localStore.get('groqKey');
+    if (localKey && typeof localKey === 'string' && localKey.trim().length > 5) return localKey.trim();
+  } catch (e) {}
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'groqKey').single();
+    if (data?.value && typeof data.value === 'string' && data.value.trim().length > 5) return data.value.trim();
+  } catch (e) {}
+  return null;
+}
+
 async function ensureLoaded() {
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey || apiKey === 'YOUR_GROQ_API_KEY') {
-    throw new Error('Groq API Key is not configured. Please set GROQ_API_KEY in your .env file to use Voice Commands.');
+  const apiKey = await getGroqApiKey();
+  if (!apiKey) {
+    throw new Error('Groq API Key is not configured for Voice. Please enter your Groq API Key in Settings (chrome://settings).');
   }
   return true;
 }
@@ -84,18 +94,27 @@ async function transcribe(audioData) {
     return '';
   }
 
+  // Cap to max 30 seconds of audio (16,000 * 30 = 480,000 samples) to prevent 413 Payload Too Large
+  const MAX_SAMPLES = 16000 * 30;
+  let finalAudioData = audioData;
+  if (audioData.length > MAX_SAMPLES) {
+    console.warn(`[WhisperEngine] Audio buffer large (${(audioData.length / 16000).toFixed(1)}s). Truncating to last 30s.`);
+    finalAudioData = audioData.slice(-MAX_SAMPLES);
+  }
+
   try {
-    const wavBuffer = float32ToWav(audioData, 16000);
+    const wavBuffer = float32ToWav(finalAudioData, 16000);
     const formData = new FormData();
     const blob = new Blob([wavBuffer], { type: 'audio/wav' });
     formData.append('file', blob, 'audio.wav');
     formData.append('model', 'whisper-large-v3-turbo');
     formData.append('response_format', 'json');
 
+    const apiKey = await getGroqApiKey();
     const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
+        'Authorization': `Bearer ${apiKey}`
       },
       body: formData
     });

@@ -11,9 +11,9 @@ async function getStore() {
 }
 
 let authStore, offlineStore, syncQueueStore;
-async function getAuthStore() { if (!authStore) { const S = await getStore(); authStore = new S({ name: 'actra-auth-store', projectName: 'Actra' }); } return authStore; }
-async function getOfflineStore() { if (!offlineStore) { const S = await getStore(); offlineStore = new S({ name: 'actra-offline-cache', projectName: 'Actra' }); } return offlineStore; }
-async function getSyncQueueStore() { if (!syncQueueStore) { const S = await getStore(); syncQueueStore = new S({ name: 'actra-sync-queue', projectName: 'Actra' }); } return syncQueueStore; }
+async function getAuthStore() { if (!authStore) { const S = await getStore(); authStore = new S({ name: 'actra-auth-store' }); } return authStore; }
+async function getOfflineStore() { if (!offlineStore) { const S = await getStore(); offlineStore = new S({ name: 'actra-offline-cache' }); } return offlineStore; }
+async function getSyncQueueStore() { if (!syncQueueStore) { const S = await getStore(); syncQueueStore = new S({ name: 'actra-sync-queue' }); } return syncQueueStore; }
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;

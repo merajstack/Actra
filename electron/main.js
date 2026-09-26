@@ -4,8 +4,15 @@
  */
 const { app, BrowserWindow, BrowserView, ipcMain, session, Menu, dialog, clipboard } = require('electron');
 const path = require('path');
+const fs = require('fs');
 const { default: Store } = require('electron-store');
-const store = new Store();
+const { autoUpdater } = require('electron-updater');
+const store = new Store({ projectName: 'Actra' });
+const APP_NAME = 'Actra';
+
+app.setName(APP_NAME);
+app.setAppUserModelId('com.actra.browser');
+process.title = APP_NAME;
 
 const TabManager = require('./tab-manager');
 const DownloadManager = require('./download-manager');
@@ -28,6 +35,10 @@ const AuditLog        = require('./ai/audit-log');
 const ChatManager     = require('./ai/chat-manager');
 const googleAuth      = require('./google-auth');
 const googleWorkspace = require('./ai/google-workspace');
+const { LocalModelManager } = require('./local-model-manager');
+const { LocalVisionServer } = require('./ai/local-vision-server');
+const { BrowserAgent } = require('./ai/browser-agent');
+const GroundingRouter = require('./ai/grounding-router');
 
 let mainWindow = null;
 let tabManager = null;
@@ -46,15 +57,90 @@ let memoryStore          = null;
 let companionManager     = null;
 let auditLog             = null;
 let chatManager          = null;
+let browserAgent         = null;
+let localModelManager    = null;
+let localVisionServer    = null;
+let groundingRouter      = null;
+
+function getAppIconPath() {
+  const candidates = [
+    path.join(__dirname, '../public/app.png'),
+    path.join(__dirname, '../dist/app.png'),
+  ];
+  return candidates.find(candidate => fs.existsSync(candidate)) || candidates[0];
+}
+
+function sendUpdaterEvent(channel, data = {}) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, data);
+  }
+}
+
+function isMissingMacUpdateFeed(error) {
+  return process.platform === 'darwin' && (
+    error?.code === 'ERR_UPDATER_CHANNEL_FILE_NOT_FOUND' ||
+    /latest-mac\.yml|Cannot find .*update info/i.test(error?.message || '')
+  );
+}
+
+function setupAutoUpdater() {
+  if (!app.isPackaged) return;
+
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = false;
+
+  autoUpdater.on('checking-for-update', () => sendUpdaterEvent('updater:status', { status: 'checking' }));
+  autoUpdater.on('update-available', (info) => sendUpdaterEvent('updater:status', {
+    status: 'available',
+    version: info.version,
+  }));
+  autoUpdater.on('update-not-available', () => sendUpdaterEvent('updater:status', { status: 'current' }));
+  autoUpdater.on('download-progress', (progress) => sendUpdaterEvent('updater:status', {
+    status: 'downloading',
+    percent: Math.round(progress.percent),
+  }));
+  autoUpdater.on('update-downloaded', (info) => sendUpdaterEvent('updater:status', {
+    status: 'downloaded',
+    version: info.version,
+  }));
+  autoUpdater.on('error', (error) => {
+    if (isMissingMacUpdateFeed(error)) {
+      console.warn('[Updater] Mac update feed is not present in the latest GitHub release. Upload latest-mac.yml and the Mac ZIP to enable Mac updates.');
+      sendUpdaterEvent('updater:status', { status: 'unavailable' });
+      return;
+    }
+    console.error('[Updater] Update failed:', error);
+    sendUpdaterEvent('updater:status', { status: 'error', message: error.message });
+  });
+
+  autoUpdater.checkForUpdatesAndNotify().catch((error) => {
+    if (isMissingMacUpdateFeed(error)) {
+      console.warn('[Updater] Mac update feed is not present in the latest GitHub release. Upload latest-mac.yml and the Mac ZIP to enable Mac updates.');
+      sendUpdaterEvent('updater:status', { status: 'unavailable' });
+      return;
+    }
+    console.error('[Updater] Could not check for updates:', error);
+    sendUpdaterEvent('updater:status', { status: 'error', message: error.message });
+  });
+}
 
 function createWindow() {
+  const iconPath = getAppIconPath();
+  if (process.platform === 'darwin' && app.dock) {
+    try {
+      app.dock.setIcon(iconPath);
+    } catch (_) {}
+  }
+
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 800,
     minWidth: 800,
     minHeight: 600,
+    title: APP_NAME,
     titleBarStyle: 'hiddenInset',
     backgroundColor: '#FDFBF7',
+    icon: iconPath,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -81,9 +167,43 @@ function createWindow() {
   
   taskManager          = new TaskManager(mainWindow);
   policyEngine         = new PolicyEngine();
-  approvalEngine       = new ApprovalEngine(mainWindow);
+  approvalEngine       = new ApprovalEngine(policyEngine);
   plannerEngine        = new PlannerEngine(modelGateway, memoryStore);
   chatManager          = new ChatManager();
+  localModelManager    = new LocalModelManager();
+  const localModelPaths = localModelManager.getModelPaths();
+  localVisionServer = new LocalVisionServer({
+    runtimePath: localModelPaths['ui-tars-runtime'],
+    modelPath: localModelPaths['ui-tars-weights'],
+    projectorPath: localModelPaths['ui-tars-projector'],
+  });
+  localModelManager.on('status', status => sendUpdaterEvent('local-models:status', status));
+  if (localModelManager.getStatus().ready) {
+    localVisionServer.start().catch(error => console.error('[UI-TARS] Vision server start failed:', error.message));
+  }
+
+  // Unified grounding pipeline — resolves elements via DOM → LLM → Remote Vision → Local Vision
+  groundingRouter = new GroundingRouter({
+    browserInteraction:   browserInteractionEngine,
+    planner:              plannerEngine,
+    tabManager,
+    getLocalVisionServer: () => localVisionServer,
+    auditLog,
+  });
+
+  browserAgent = new BrowserAgent({
+    tabManager,
+    taskManager,
+    chatManager,
+    auditLog,
+    modelGateway,
+    getLocalVisionServer: () => localVisionServer,
+    getLocalModelManager: () => localModelManager,
+    browserInteractionEngine,
+    pageContextEngine,
+    groundingRouter,
+    planner: plannerEngine,
+  });
 
   // Tie TaskManager updates to React UI
   taskManager.on('task-updated', (task) => {
@@ -97,7 +217,6 @@ function createWindow() {
   });
 
   // Load renderer UI
-  const fs = require('fs');
   const indexHtmlPath = path.join(__dirname, '../dist/index.html');
 
   if (fs.existsSync(indexHtmlPath)) {
@@ -109,6 +228,8 @@ function createWindow() {
   }
 
   createAppMenu(mainWindow, tabManager);
+
+  setupAutoUpdater();
 
   mainWindow.on('closed', () => { mainWindow = null; });
 }
@@ -215,6 +336,24 @@ ipcMain.handle('window:isFullscreen', () => {
   return mainWindow ? mainWindow.isFullScreen() : false;
 });
 
+ipcMain.handle('updater:install', () => {
+  if (!app.isPackaged) return { success: false, error: 'Updates are disabled in development.' };
+  autoUpdater.quitAndInstall();
+  return { success: true };
+});
+
+ipcMain.handle('local-models:get-status', () => localModelManager
+  ? localModelManager.getStatus()
+  : { ready: false, downloading: false, files: [], error: 'Local model manager is not ready.' });
+ipcMain.handle('local-models:download', async () => {
+  if (!localModelManager) return { ready: false, downloading: false, files: [], error: 'Local model manager is not ready.' };
+  const status = await localModelManager.downloadAll();
+  if (status.ready && localVisionServer) {
+    localVisionServer.start().catch(error => console.error('[UI-TARS] Vision server start failed:', error.message));
+  }
+  return status;
+});
+
 ipcMain.handle('window:requestMicAccess', async () => {
   if (process.platform === 'darwin') {
     const { systemPreferences } = require('electron');
@@ -236,11 +375,16 @@ ipcMain.handle('tab:setUIChromeHeight', (_, height) => {
 });
 
 ipcMain.handle('tab:setSidebarWidth', (_, width) => {
-  tabManager.sidebarWidth = Math.round(width);
-  if (tabManager.activeTabId) {
-    const view = tabManager.tabs.get(tabManager.activeTabId);
-    if (view) tabManager.updateViewBounds(view);
+  if (tabManager && typeof tabManager.setSidebarWidth === 'function') {
+    tabManager.setSidebarWidth(width);
+  } else if (tabManager) {
+    tabManager.sidebarWidth = Math.round(width);
+    if (tabManager.activeTabId) {
+      const view = tabManager.tabs.get(tabManager.activeTabId);
+      if (view) tabManager.updateViewBounds(view);
+    }
   }
+  return true;
 });
 
 // ─── AI IPC Handlers ──────────────────────────────────────────────────────
@@ -296,7 +440,108 @@ ipcMain.handle('ai:cancel-all-tasks', () => {
  * → [WAITING_FOR_APPROVAL] → EXECUTE_APPROVED_ACTIONS → VERIFY_RESULT
  * → AUDIT_LOG → FINAL_RESPONSE (COMPLETED)
  */
-async function executeAICommand(command, activeTabId) {
+function isHtmlEmailRequest(command, args = {}) {
+  return Boolean(args.html) || /\b(html|formatted|rich email|green background|colored background|background color|button|call[- ]to[- ]action|newsletter|email design|email template|render)\b/i.test(command || '');
+}
+
+async function prepareHtmlEmail(command, args) {
+  if (!isHtmlEmailRequest(command, args) || args.html) return args;
+
+  const { text } = await modelGateway.chat([{ role: 'user', content: JSON.stringify({ request: command, email: args }) }], {
+    systemInstruction: 'Create the final email requested by the user. Infer the visual intent and content intent from the request. Return JSON only with string fields subject, body, and html. The html must be a complete email body using safe inline formatting with p, br, strong, em, ul, li, table, and button-like links when requested. Do not use scripts, style tags, forms, external resources, or markdown. Keep body as a faithful plain-text fallback.',
+    temperature: 0.2,
+    maxTokens: 1600,
+  });
+  const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  const enhanced = JSON.parse(jsonText);
+  if (!enhanced.subject || !enhanced.body || !enhanced.html) throw new Error('The AI could not create a complete HTML email draft.');
+  return { ...args, subject: enhanced.subject, body: enhanced.body, html: enhanced.html, htmlRequest: true };
+}
+
+// Detects pure-chat messages via keyword heuristics — no LLM call needed.
+function isLikelyConversational(command) {
+  if (isPureWorkspaceRead(command)) return false;
+  if (isHybridWebEmailWorkflow(command)) return false;
+
+  const t = (command || '').trim();
+  if (!t) return true;
+  const words = t.split(/\s+/);
+  // Very short AND no site/action words → greeting or simple question
+  if (words.length <= 3 && !/\b(open|go|play|search|find|click|scroll|book|buy|watch|visit|navigate|download|send|create|write|email)\b/i.test(t)) return true;
+  // Action verbs that imply the AI should DO something in the browser or workspace
+  const actionPattern = /\b(open|navigate|go to|click|type into|fill|search( for)?|find|play|submit|book|buy|order|scroll|download|send|create|write|extract|solve|answer|fix|compare|reserve|email|summarize (the |this )?(page|article)|what.?s on (this|the) page|read (this|the) page|analyze (this|the)|show me (the )?(page|site)|take a screenshot)\b/i;
+  return !actionPattern.test(t);
+}
+
+/**
+ * Returns true ONLY for PURE inbox/calendar/sheet/drive READ or WRITE queries
+ * that have no external website intent.
+ * A command like "open wikipedia and send mail" is NOT a pure workspace action.
+ */
+function isLikelyWorkspaceAction(command) {
+  return isPureWorkspaceRead(command) || isHybridWebEmailWorkflow(command);
+}
+
+// Pure workspace: user wants to read/check/send workspace data with no external web navigation.
+function isPureWorkspaceRead(command) {
+  const t = (command || '').trim();
+
+  // If the command references ANY external website or URL, it is definitively NOT a pure workspace read.
+  // The same comprehensive list used by isHybridWebEmailWorkflow.
+  const externalSitePattern = /\b(wikipedia|youtube|github|amazon|reddit|twitter|instagram|linkedin|netflix|google|stackoverflow|discord|tiktok|spotify|notion|figma|vercel|flipkart|ebay|yahoo|bing|duckduckgo|medium|heroku|cloudflare|makemytrip|quora|substack|hashnode|dev\.to|producthunt|crunchbase|forbes|techcrunch|bbc|cnn|nytimes|arxiv|pubmed|imdb|booking|airbnb)\b|https?:\/\//i;
+  if (externalSitePattern.test(t)) return false;
+
+  const mailPattern = /\b(mail|mails|email|emails|gmail|inbox)\b/i;
+  const calendarPattern = /\b(calendar|events?|meetings?|schedule)\b/i;
+  const sheetPattern = /\b(sheets?|spreadsheets?)\b/i;
+  const docsDrivePattern = /\b(google drive|drive files?|google docs?|docs?)\b/i;
+  return mailPattern.test(t) || calendarPattern.test(t) || sheetPattern.test(t) || docsDrivePattern.test(t);
+}
+
+/**
+ * Returns true for HYBRID tasks: external web navigation + email sending.
+ * e.g. "Open Wikipedia about peacocks, copy data and send mail to X"
+ * These must go to the FULL planner, not to Fast Path 3 gmail search.
+ */
+function isHybridWebEmailWorkflow(command) {
+  const t = (command || '').trim();
+  // Any external website or URL
+  const externalSitePattern = /\b(wikipedia|youtube|github|amazon|reddit|twitter|instagram|linkedin|netflix|google|stackoverflow|discord|tiktok|spotify|notion|figma|vercel|flipkart|ebay|yahoo|bing|duckduckgo|medium|heroku|cloudflare|makemytrip|quora|substack|hashnode|dev\.to|hacker news|producthunt|crunchbase|forbes|techcrunch|bbc|cnn|nytimes|arxiv|pubmed|imdb|booking|airbnb)\b|https?:\/\//i;
+  // Signal 1: any email action verb
+  const emailVerbPattern = /\b(send|email|mail|forward|share)\b/i;
+  // Signal 2: a recipient (email address OR "to [person/me/myself]")
+  const recipientPattern = /\b(to\s+[\w.+-]+@[\w.-]+|email\s+to\s|mail\s+to\s|send\s+to\s|to\s+my\s+(professor|teacher|boss|manager|colleague|team|friend|mentor|client|partner|cto|ceo|hr)|via\s+email|by\s+email|through\s+email|to\s+myself)\b/i;
+  return externalSitePattern.test(t) && emailVerbPattern.test(t) && recipientPattern.test(t);
+}
+
+// Detects tasks that require browser UI automation — routes directly to BrowserAgent
+// without an LLM planning round-trip. Bypasses the planner entirely.
+function isLikelyBrowserAction(command) {
+  // Hybrid workflows (web research + email) need the FULL planner, not the browser-only fast path
+  if (isHybridWebEmailWorkflow(command)) return false;
+  // Never treat pure workspace actions (inbox check, calendar, sheets) as browser UI automation
+  if (isPureWorkspaceRead(command) && !isHybridWebEmailWorkflow(command)) return false;
+
+  const t = (command || '').trim();
+  // Explicit navigation/interaction verbs
+  const navPattern = /\b(open|go to|navigate to|visit|browse|load|launch|show me)\b/i;
+  // Search/content interaction
+  const interactPattern = /\b(search( for)?( on)?|find( on)?|look up|play|watch|click|scroll|fill( in| out)?|submit|book|buy|order|download|sign up|log in|sign in)\b/i;
+  // Well-known websites (user almost always wants to navigate there)
+  const sitePattern = /\b(youtube|google|twitter|reddit|amazon|netflix|github|instagram|linkedin|wikipedia|facebook|tiktok|spotify|medium|stackoverflow|discord|x\.com|bing|duckduckgo|yahoo|ebay|flipkart|notion|figma|canva|vercel|heroku|cloudflare)\b/i;
+  // Raw URL
+  const urlPattern = /https?:\/\//i;
+  // MCQ / Quiz solver — always a browser UI task
+  const mcqPattern = /\b(solve (the |all |these |this )?(mcq|mcqs|quiz|questions?|exam|test)|answer (the |all |these |this )?(mcq|mcqs|questions?|options?)|select (the |all )?(options?|answers?)|auto(matically)? (solve|answer|select)|do (the |this )?(quiz|test|exam|questions?)|click (options?|answers?) (and|then) (next|submit)|attempt (the |this )?(quiz|test|exam))\b/i;
+  const tabMcqPattern = /\b(mcq|mcqs|quiz|questions?)\b.*\b(tab (one|1|two|2|three|3|four|4|five|5))/i;
+  const oneByOneMcqPattern = /\bone by one\b/i.test(t) && /\b(mcq|mcqs|quiz|question|answer|option|tab)/i.test(t);
+  return navPattern.test(t) || interactPattern.test(t) || sitePattern.test(t) || urlPattern.test(t)
+    || mcqPattern.test(t) || tabMcqPattern.test(t) || oneByOneMcqPattern
+    || /\b(solve|answer)\b.*\b(one by one|one-by-one)\b/i.test(t)
+    || /\b(solve|answer)\b.*\b(mcq|mcqs|quiz)\b/i.test(t);
+}
+
+async function executeAICommand(command, activeTabId, mcqModel) {
   // 1. Add User Message
   await chatManager.addMessage('user', command);
 
@@ -310,20 +555,154 @@ async function executeAICommand(command, activeTabId) {
   const actionsProposed = [];
   const dataSourcesUsed = [];
 
+  // The planner will categorize MCQs, quizzes, reasoning tasks, and general browsing as ACTION_COMPLEX.
+
   // Return immediately so CommandBar closes; all work is async
   (async () => {
     try {
+      // ── FAST PATH 1: Pure chat/Q&A — skip planning entirely ───────────
+      if (isLikelyConversational(command) && !isLikelyBrowserAction(command)) {
+        taskManager.updateTaskStatus(task.id, 'analyzing');
+        try {
+          let history = await chatManager.getHistory();
+          if (history.length > 5) history = history.slice(-5);
+          const msgs = [
+            ...history.map(m => ({ role: m.role, content: m.content })),
+            { role: 'user', content: command }
+          ];
+          const { text } = await modelGateway.chat(msgs, {
+            maxTokens: 400, temperature: 0.7,
+            systemInstruction: 'You are Actra, an autonomous AI browser assistant. Respond concisely — 3 lines max for simple questions. Never reveal internal reasoning tags.',
+          });
+          const out = text || 'How can I help?';
+          taskManager.updateTaskStatus(task.id, 'completed', { outputs: out });
+          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: out });
+          auditLog.updateEntry(auditEntryId, { execution_status: 'success', execution_result: 'chat' });
+        } catch (fastErr) {
+          taskManager.updateTaskStatus(task.id, 'failed', { error: fastErr.message });
+          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: `Error: ${fastErr.message}` });
+          auditLog.updateEntry(auditEntryId, { execution_status: 'failed', error: fastErr.message });
+        }
+        return;
+      }
 
-      // ── UNDERSTAND_REQUEST ────────────────────────────────────────────
+      // ── FAST PATH 2: Browser action — skip planner, go directly to BrowserAgent
+      // This prevents qwq-32b from misclassifying browser tasks as INFORMATIONAL
+      if (isLikelyBrowserAction(command)) {
+        taskManager.updateTaskStatus(task.id, 'executing');
+        try {
+          await browserAgent.execute(command, activeTabId, task, assistantMsg, auditEntryId, mcqModel);
+        } catch (browserErr) {
+          console.error('[BrowserAgent] Fast-path execution failed:', browserErr.message);
+          taskManager.updateTaskStatus(task.id, 'failed', { error: browserErr.message });
+          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: `❌ ${browserErr.message}` });
+          auditLog.updateEntry(auditEntryId, { execution_status: 'failed', error: browserErr.message });
+        }
+        return;
+      }
+
+      // ── FAST PATH 3: Pure Google Workspace READ operations (Gmail search, Calendar, Drive) ──
+      // Only activates for pure inbox/calendar/drive queries with NO external web navigation intent.
+      // Hybrid workflows (e.g. "open Wikipedia and send mail") are handled by the full planner below.
+      if (isPureWorkspaceRead(command) && !isHybridWebEmailWorkflow(command)) {
+        taskManager.updateTaskStatus(task.id, 'executing');
+        const workspaceStep = taskManager.addStep(task.id, '📬 Checking Google Workspace…', 'running', 'execute');
+
+        try {
+          if (!(await googleAuth.isAuthenticated())) {
+            throw new Error('Google Workspace sign-in required. Please click "Sign in with Google" in the AI Side Panel.');
+          }
+
+          const globalGatherResults = {};
+
+          // Gmail Search
+          if (/\b(mail|mails|email|emails|gmail|inbox)\b/i.test(command)) {
+            taskManager.updateStep(task.id, workspaceStep.id, 'running', '🔍 Searching your Gmail inbox…');
+            const searchQuery = command.replace(/\b(check|my|mail|mails|email|emails|inbox|gmail|is|there|any|tell|me|about|show|get|all|for|related|related to)\b/gi, ' ').trim();
+            const emails = await googleWorkspace.searchGmail(searchQuery || command, 25);
+            globalGatherResults['search_gmail'] = emails;
+          }
+
+          // Calendar Events
+          if (/\b(calendar|events?|meetings?|schedule)\b/i.test(command)) {
+            taskManager.updateStep(task.id, workspaceStep.id, 'running', '📅 Checking your Google Calendar…');
+            const events = await googleWorkspace.getCalendarEvents();
+            globalGatherResults['get_calendar_events'] = events;
+          }
+
+          // Google Drive Files
+          if (/\b(drive|files?|google drive|docs?)\b/i.test(command)) {
+            taskManager.updateStep(task.id, workspaceStep.id, 'running', '📁 Searching Google Drive…');
+            const driveQuery = command.replace(/\b(search|my|drive|google|files?|find|in|for|docs?)\b/gi, ' ').trim();
+            const files = await googleWorkspace.searchDrive(driveQuery, 15);
+            globalGatherResults['search_drive'] = files;
+          }
+
+          taskManager.updateStep(task.id, workspaceStep.id, 'completed', 'Data retrieved from Google Workspace.');
+
+          // Synthesize response with Ground Truth data
+          const analyzeStep = taskManager.addStep(task.id, '🧠 Analyzing and formatting report…', 'running', 'analyze');
+          const dataContext = JSON.stringify(globalGatherResults, null, 2).slice(0, 25000);
+          
+          let history = await chatManager.getHistory();
+          if (history.length > 5) history = history.slice(-5);
+          const historyContext = history.length > 0 
+            ? `Conversation History:\n${history.map(m => `[${m.role.toUpperCase()}]: ${m.content}`).join('\n')}\n`
+            : '';
+
+          const synthPrompt = `User asked: "${command}"
+
+${historyContext}
+Gathered data (GROUND TRUTH FROM GMAIL / GOOGLE WORKSPACE):
+${dataContext}
+
+CRITICAL RESPONSE RULES:
+1. STRICT GROUND TRUTH: Base your entire answer ONLY on the gathered data above. NEVER fabricate or simulate fake emails, dates, or senders.
+2. RICH STRUCTURED EXECUTIVE FORMAT (When emails are found):
+   - Start with: "I checked your Gmail for emails related to [Topic]. I found [X] relevant email(s):"
+   - For each email found (ordered chronologically from most recent):
+     ### [Email Subject / Key Event Name] — [Formatted Date]
+     - **Status / Summary:** [Direct takeaway, e.g. Selected for Round 2 / Registration Confirmed]
+     - **Sender:** [Sender name / email]
+     - **Key Details & Guidelines:** [Include assessment window, duration, format, questions, word count, proctoring rules, system requirements, deadlines, team details, etc. exactly as mentioned in the email body]
+   - Mention if any follow-up emails were checked or if no newer emails exist after the latest date.
+   - If the user asks for the full content of an email, provide the complete email body accurately.
+3. If no matching data was found or "no_emails_found" is in the gathered data, state truthfully that you searched the inbox but no emails matching that topic were found.
+
+CRITICAL INSTRUCTION: If your response contains any URLs or links, you MUST output EACH link inside its own dedicated markdown code block, like this:
+\`\`\`text
+https://example.com
+\`\`\``;
+
+          const systemInstruction = 'You are Actra, an autonomous AI browser assistant with direct authorized access to Google Workspace. Summarize ground-truth data accurately with complete fidelity. Never leak internal reasoning tags.';
+
+          let { text } = await modelGateway.chat([{ role: 'user', content: synthPrompt }], { maxTokens: 2500, systemInstruction });
+
+          taskManager.updateStep(task.id, analyzeStep.id, 'completed');
+          taskManager.updateTaskStatus(task.id, 'completed', { outputs: text });
+          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: text });
+          auditLog.updateEntry(auditEntryId, { execution_status: 'success', execution_result: 'workspace_success' });
+
+        } catch (wsErr) {
+          console.error('[Workspace] Fast-path execution failed:', wsErr.message);
+          taskManager.updateStep(task.id, workspaceStep.id, 'failed', wsErr.message);
+          taskManager.updateTaskStatus(task.id, 'failed', { error: wsErr.message });
+          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: `❌ ${wsErr.message}` });
+          auditLog.updateEntry(auditEntryId, { execution_status: 'failed', error: wsErr.message });
+        }
+        return;
+      }
+
+      // ── UNDERSTAND_REQUEST (Workspace API tasks only) ─────────────────
       taskManager.updateTaskStatus(task.id, 'understanding');
       const understandStep = taskManager.addStep(task.id, '🔍 Understanding your request…', 'running', 'understand');
 
       let understanding = null;
       let history = await chatManager.getHistory();
-      if (history.length > 10) history = history.slice(-10); // cap to prevent 413
+      if (history.length > 5) history = history.slice(-5); // cap to 5 messages to save tokens
       try {
         if (!modelGateway.isAvailable()) {
-          throw new Error('AI Model not available. Please set GROQ_API_KEY in your .env file.');
+          throw new Error('AI Model not available. Please configure your Cloudflare or Groq credentials in Settings (chrome://settings).');
         }
         understanding = await plannerEngine.understandRequest(command, history);
         taskManager.updateTaskStatus(task.id, 'understanding', { understanding });
@@ -338,7 +717,7 @@ async function executeAICommand(command, activeTabId) {
       const needsWorkspace = understanding.required_apps?.some(a =>
         a && ['gmail', 'calendar', 'sheets', 'drive', 'docs'].includes(a.toLowerCase())
       );
-      if (needsWorkspace && !googleAuth.isAuthenticated()) {
+      if (needsWorkspace && !(await googleAuth.isAuthenticated())) {
         throw new Error('Google Workspace sign-in required. Please click "Sign in with Google" in the AI Side Panel.');
       }
 
@@ -435,6 +814,7 @@ async function executeAICommand(command, activeTabId) {
             to:      { type: 'string', description: 'Recipient email address' },
             subject: { type: 'string', description: 'Email subject line' },
             body:    { type: 'string', description: 'Full email body text' },
+            html:    { type: 'string', description: 'Optional HTML body. Use only for formatting, not scripts.' },
           }, required: ['to', 'subject', 'body'] },
         },
         {
@@ -481,11 +861,30 @@ async function executeAICommand(command, activeTabId) {
             url: { type: 'string', description: 'URL to navigate to' }
           }, required: ['url'] },
         },
+        {
+          name: 'browser_extract_page_text',
+          description: 'Extracts the main readable text content from the currently active browser tab for research, formatting, or sending via email.',
+          parameters: { type: 'object', properties: {} },
+        },
+        {
+          name: 'browser_take_screenshot',
+          description: 'Captures a screenshot of the currently active browser tab.',
+          parameters: { type: 'object', properties: {} },
+        },
       ];
 
-      if (understanding.execution_target === 'BROWSER_UI' && understanding.route === 'ACTION_SIMPLE') {
-        plan.steps = understanding.simple_plan || [];
-      } else if (understanding.execution_target === 'GOOGLE_WORKSPACE_API' || (understanding.execution_target === 'BROWSER_UI' && understanding.route === 'ACTION_COMPLEX')) {
+      if (understanding.execution_target === 'BROWSER_UI') {
+        // Hand off entirely to the Browser Agent
+        try {
+          await browserAgent.execute(command, activeTabId, task, assistantMsg, auditEntryId, mcqModel);
+        } catch (error) {
+          console.error('[BrowserAgent] workflow failed:', error);
+          taskManager.updateTaskStatus(task.id, 'failed', { error: error.message });
+          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: `Error: ${error.message}` });
+          auditLog.updateEntry(auditEntryId, { execution_status: 'failed', error: error.message });
+        }
+        return { success: true, taskId: task.id };
+      } else if (understanding.execution_target === 'GOOGLE_WORKSPACE_API') {
         const planStep = taskManager.addStep(task.id, '📋 Generating Macro-Plan…', 'running', 'plan');
 
         let complexPlan = await plannerEngine.createPlan(understanding, pageContext, tools, history, []);
@@ -514,7 +913,7 @@ async function executeAICommand(command, activeTabId) {
 
         try {
           let result;
-          const args = step.args || {};
+          let args = step.args || {};
           
           if (step.action === 'browser_navigate') {
             mainWindow.webContents.send('animate-address-bar-navigation', { tabId: activeTabId, url: args.url });
@@ -525,6 +924,35 @@ async function executeAICommand(command, activeTabId) {
             });
             result = `Navigated to ${args.url}`;
           } else if (step.action === 'browser_type' || step.action === 'browser_click') {
+            // Prefer screenshot grounding. DOM resolution remains a recovery path for pages
+            // where the vision server cannot start or returns an unusable action.
+            let visualAction = null;
+            if (localVisionServer && localModelManager?.getStatus().ready) {
+              try {
+                const screenshot = await tabManager.captureScreenshot(activeTabId);
+                if (screenshot) {
+                  visualAction = await localVisionServer.infer(
+                    screenshot,
+                    `${step.action === 'browser_click' ? 'Click' : 'Type'} the ${args.targetDescription || 'requested control'}. ${step.action === 'browser_type' ? `Enter exactly: ${args.text || ''}` : ''}`
+                  );
+                }
+              } catch (error) {
+                console.warn('[UI-TARS] Visual action failed, using DOM recovery:', error.message);
+              }
+            }
+
+            if (visualAction && (visualAction.action === 'click' || visualAction.action === 'type') && Number.isFinite(visualAction.x) && Number.isFinite(visualAction.y)) {
+              if (step.riskLevel > 0) {
+                taskManager.updateTaskStatus(task.id, 'waiting_approval');
+                const approval = await approvalEngine.evaluateAction({ name: step.action, args }, { url: pageContext.url, taskId: task.id, reason: plan.interpretation });
+                if (!approval.approved) throw new Error(approval.reason || 'Rejected by user');
+                if (approval.editedArgs) args = { ...args, ...approval.editedArgs };
+                taskManager.updateTaskStatus(task.id, 'executing');
+              }
+              result = visualAction.action === 'type'
+                ? await browserInteractionEngine.typeAt(activeTabId, visualAction.x, visualAction.y, args.text || visualAction.text || '')
+                : await browserInteractionEngine.clickAt(activeTabId, visualAction.x, visualAction.y);
+            } else {
             // 1. Local Semantic Resolution with State-Based Waiting (up to 15s)
             let elementId = null;
             let candidates = [];
@@ -557,6 +985,7 @@ async function executeAICommand(command, activeTabId) {
               taskManager.updateTaskStatus(task.id, 'waiting_approval');
               const approval = await approvalEngine.evaluateAction({ name: step.action, args }, { url: pageContext.url, taskId: task.id, reason: plan.interpretation });
               if (!approval.approved) throw new Error(approval.reason || 'Rejected by user');
+              if (approval.editedArgs) args = { ...args, ...approval.editedArgs };
               taskManager.updateTaskStatus(task.id, 'executing');
             }
 
@@ -565,10 +994,51 @@ async function executeAICommand(command, activeTabId) {
             } else {
                result = await browserInteractionEngine.clickElement(activeTabId, elementId);
             }
+            }
           } else if (step.action === 'browser_press_key') {
              result = await browserInteractionEngine.pressKey(activeTabId, args.key);
           } else if (step.action === 'browser_scroll') {
-             result = await browserInteractionEngine.scrollPage(activeTabId, args.amount);
+             let visualAction = null;
+             if (localVisionServer && localModelManager?.getStatus().ready) {
+               try {
+                 const screenshot = await tabManager.captureScreenshot(activeTabId);
+                 if (screenshot) visualAction = await localVisionServer.infer(screenshot, `Scroll ${args.amount < 0 ? 'up' : 'down'} to continue the task.`);
+               } catch (error) {
+                 console.warn('[UI-TARS] Visual scroll failed, using planner amount:', error.message);
+               }
+             }
+             const amount = visualAction?.action === 'scroll' && Number.isFinite(visualAction.amount)
+               ? (visualAction.direction === 'up' ? -Math.abs(visualAction.amount) : Math.abs(visualAction.amount))
+               : args.amount;
+             result = await browserInteractionEngine.scrollPage(activeTabId, amount);
+          } else if (step.action === 'browser_extract_page_text') {
+             const tabView = tabManager.tabs.get(activeTabId);
+             if (!tabView) throw new Error('No active browser tab found for extraction.');
+             
+             // Wait 1.5s for dynamic content to render
+             await new Promise(r => setTimeout(r, 1500));
+             
+             const extracted = await tabView.webContents.executeJavaScript(`
+               (() => {
+                 const clone = document.body.cloneNode(true);
+                 clone.querySelectorAll('script, style, noscript, nav, header, footer, svg, iframe, .ad, .ads').forEach(el => el.remove());
+                 const mainEl = clone.querySelector('main, article, #content, #mw-content-text') || clone;
+                 const title = document.title || '';
+                 const text = mainEl.innerText.replace(/\\n{3,}/g, '\\n\\n').trim();
+                 return {
+                   title,
+                   url: window.location.href,
+                   text: text.slice(0, 8000)
+                 };
+               })();
+             `);
+             
+             globalGatherResults['browser_extract_page_text'] = extracted;
+             result = `Extracted ${extracted.text?.length || 0} characters from "${extracted.title || 'page'}"`;
+           } else if (step.action === 'browser_take_screenshot') {
+             const screenshot = await tabManager.captureScreenshot(activeTabId);
+             globalGatherResults['browser_take_screenshot'] = { captured: Boolean(screenshot) };
+             result = 'Captured page screenshot';
           } else if ((step.action || '').startsWith('search_') || (step.action || '').startsWith('read_') || (step.action || '').startsWith('get_')) {
              // Safe Gather operations
              if (step.action === 'search_gmail') result = await googleWorkspace.searchGmail(args.query, args.maxResults);
@@ -581,14 +1051,26 @@ async function executeAICommand(command, activeTabId) {
              result = Array.isArray(result) ? `Found ${result.length} results` : String(result).slice(0, 200);
           } else {
              // Other Write Operations
+             if (step.action === 'send_email') {
+               // Interpolate extracted page content into email body if needed
+               if (typeof args.body === 'string' && args.body.includes('{{browser_extract_page_text.text}}')) {
+                 const extracted = globalGatherResults['browser_extract_page_text']?.text || '';
+                 args.body = args.body.replace(/\{\{browser_extract_page_text\.text\}\}/g, extracted);
+               } else if ((!args.body || args.body.length < 50) && globalGatherResults['browser_extract_page_text']?.text) {
+                 args.body = globalGatherResults['browser_extract_page_text'].text;
+               }
+
+               args = await prepareHtmlEmail(command, args);
+             }
              if (step.riskLevel > 0) {
                taskManager.updateTaskStatus(task.id, 'waiting_approval');
                const approval = await approvalEngine.evaluateAction({ name: step.action, args }, { url: pageContext.url, taskId: task.id, reason: plan.interpretation });
                if (!approval.approved) throw new Error(approval.reason || 'Rejected by user');
+               if (approval.editedArgs) args = { ...args, ...approval.editedArgs };
                taskManager.updateTaskStatus(task.id, 'executing');
              }
 
-             if (step.action === 'send_email') result = await googleWorkspace.sendEmail(args.to, args.subject, args.body);
+             if (step.action === 'send_email') result = await googleWorkspace.sendEmail(args.to, args.subject, args.body, args.html);
              else if (step.action === 'write_sheet') result = await googleWorkspace.writeSheet(args.spreadsheetId, args.range, args.values);
              else if (step.action === 'update_sheet') result = await googleWorkspace.updateSheet(args.spreadsheetId, args.range, args.values);
              else if (step.action === 'create_doc') result = await googleWorkspace.createDoc(args.title, args.content);
@@ -679,7 +1161,7 @@ async function executeAICommand(command, activeTabId) {
       } else {
         const analyzeStep = taskManager.addStep(task.id, '🧠 Synthesizing final response...', 'running', 'analyze');
         
-        const dataContext = JSON.stringify(globalGatherResults, null, 2).slice(0, 3000);
+        const dataContext = JSON.stringify(globalGatherResults, null, 2).slice(0, 20000);
         const historyContext = history.length > 0 
           ? `Conversation History:\n${history.map(m => `[${m.role.toUpperCase()}]: ${m.content}`).join('\n')}\n`
           : '';
@@ -687,21 +1169,37 @@ async function executeAICommand(command, activeTabId) {
         const synthPrompt = `User asked: "${command}"
 
 ${historyContext}
-Gathered data:
+Gathered data (GROUND TRUTH FROM GMAIL & GOOGLE WORKSPACE):
 ${dataContext}
 
 Execution History:
 ${globalExecutionHistory.map(h => h.action).join(' -> ')}
 
-If the user's request was an ACTION request (e.g., you navigated, clicked, or typed), you MUST ONLY output a concise success/failure status (e.g. "✓ Task completed. The MrBeast video is playing."). Do NOT output conversational instructions explaining how the user can do it themselves.
-If the user's request was INFORMATIONAL (a general question), you MUST ALWAYS respond in 3 lines or less, summarizing the answer concisely with its core meaning.
+CRITICAL RESPONSE RULES:
+1. STRICT GROUND TRUTH: Base your entire answer ONLY on the gathered data above. NEVER fabricate, invent, or hallucinate email senders, subjects, dates, snippets, or body contents.
+2. RICH STRUCTURED EXECUTIVE FORMAT (When emails are found):
+   - Start with: "I checked your Gmail for emails related to [Topic]. I found [X] relevant email(s):"
+   - For each email found (ordered chronologically from most recent):
+     ### [Email Subject / Key Event Name] — [Formatted Date]
+     - **Status / Summary:** [Direct takeaway, e.g. Selected for Round 2 / Registration Confirmed]
+     - **Sender:** [Sender name / email]
+     - **Key Details & Guidelines:** [Include assessment window, duration, format, questions, word count, proctoring rules, system requirements, deadlines, team details, etc. exactly as mentioned in the email body]
+   - Mention if any follow-up emails were checked or if no newer emails exist after the latest date.
+   - If the user asks for the full content of an email, provide the complete email body accurately.
+3. If no matching data was found or "no_emails_found" is in the gathered data, state truthfully that you searched the inbox but no emails matching that topic were found.
+4. If the user's request was a browser UI action, output a concise status.
 
 CRITICAL INSTRUCTION: If your response contains any URLs or links, you MUST output EACH link inside its own dedicated markdown code block, like this:
 \`\`\`text
 https://example.com
 \`\`\``;
 
-        const { text } = await modelGateway.chat([{ role: 'user', content: synthPrompt }], { maxTokens: 1500 });
+        const systemInstruction = 'You are Actra, an autonomous AI browser assistant. You HAVE the capability to browse the web, take screenshots, click elements, read pages, fill forms, and solve complex tasks automatically. Do not claim you lack browser or screenshot capabilities. Never leak internal reasoning tags.';
+
+        let { text } = await modelGateway.chat([{ role: 'user', content: synthPrompt }], { maxTokens: 1500, systemInstruction });
+        
+        // (Internal reasoning tags like <think> are stripped natively by model-gateway)
+        
         finalResponseText = text;
         taskManager.updateStep(task.id, analyzeStep.id, 'completed');
       }
@@ -733,8 +1231,10 @@ https://example.com
   return { success: true, taskId: task.id };
 }
 
-ipcMain.handle('ai:send-chat-message', async (_, command, activeTabId) => {
-  return executeAICommand(command, activeTabId);
+
+
+ipcMain.handle('ai:send-chat-message', async (_, command, activeTabId, mcqModel) => {
+  return executeAICommand(command, activeTabId, mcqModel);
 });
 
 ipcMain.handle('voice:execute-command', async (_, command) => {
@@ -748,6 +1248,42 @@ ipcMain.handle('ai:resolve-approval', (_, approvalId, approved) => {
 
 ipcMain.handle('ai:edit-approval', (_, approvalId, newArgs) => {
   return approvalEngine.editAndApprove(approvalId, newArgs);
+});
+
+ipcMain.handle('ai:enhance-approval', async (_, approvalId) => {
+  const approval = approvalEngine.getPendingApproval(approvalId);
+  if (!approval || approval.action.name !== 'send_email') {
+    return { success: false, error: 'Email approval request is no longer available.' };
+  }
+
+  try {
+    const { text } = await modelGateway.chat([
+      {
+        role: 'user',
+        content: JSON.stringify({
+          to: approval.action.args.to,
+          subject: approval.action.args.subject,
+          body: approval.action.args.body,
+        }),
+      },
+    ], {
+      systemInstruction: 'Improve this email for clarity and professional formatting. Remove accidental prompt noise, internal instructions, duplicated whitespace, and irrelevant metadata. Preserve the meaning, recipient, and requested facts. Return JSON only with string fields subject, body, and html. The html must be a simple email body using safe tags such as p, br, strong, em, ul, and li. Do not include scripts, style tags, or external resources.',
+      temperature: 0.2,
+      maxTokens: 1200,
+    });
+    const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+    const enhanced = JSON.parse(jsonText);
+    if (!enhanced.subject || !enhanced.body || !enhanced.html) throw new Error('AI returned an incomplete email.');
+
+    const action = { ...approval.action, args: { ...approval.action.args, subject: enhanced.subject, body: enhanced.body, html: enhanced.html } };
+    const updated = approvalEngine.updatePendingAction(approvalId, action);
+    if (!updated) return { success: false, error: 'Email approval request expired.' };
+    mainWindow.webContents.send('ai:approval-updated', updated);
+    return { success: true, approval: updated };
+  } catch (error) {
+    console.error('[Approval] Email enhancement failed:', error);
+    return { success: false, error: error.message };
+  }
 });
 
 // Task data & approvals
@@ -771,9 +1307,9 @@ ipcMain.handle('auth:google-status',  () => googleAuth.isAuthenticated());
 ipcMain.handle('app:clear-data', async () => {
   const { default: Store } = require('electron-store');
   ['config', 'google-auth-tokens', 'bookmarks', 'history', 'memory'].forEach(name => {
-    try { new Store({ name }).clear(); } catch(e){}
+    try { new Store({ name, projectName: 'Actra' }).clear(); } catch(e){}
   });
-  try { new Store().clear(); } catch(e){}
+  try { new Store({ projectName: 'Actra' }).clear(); } catch(e){}
   await googleAuth.signOut();
   return { success: true };
 });
@@ -785,7 +1321,7 @@ ipcMain.handle('app:copy', (_, text) => {
 
 ipcMain.handle('app:save-keys', async (e, keys) => {
   const { default: Store } = require('electron-store');
-  const store = new Store({ name: 'config' });
+  const store = new Store({ name: 'config', projectName: 'Actra' });
   for (const key of ['cloudflareAccountId', 'cloudflareApiKey', 'groqKey']) {
     if (typeof keys?.[key] === 'string') store.set(key, keys[key].trim());
   }
@@ -794,7 +1330,7 @@ ipcMain.handle('app:save-keys', async (e, keys) => {
 
 ipcMain.handle('app:get-keys', async () => {
   const { default: Store } = require('electron-store');
-  const store = new Store({ name: 'config' });
+  const store = new Store({ name: 'config', projectName: 'Actra' });
   return {
     cloudflareAccountId: store.get('cloudflareAccountId', ''),
     cloudflareApiKey: store.get('cloudflareApiKey', ''),
@@ -810,7 +1346,7 @@ ipcMain.handle('auth:google-signin',  async () => {
 ipcMain.handle('auth:google-profile', async () => {
   try {
     const { google } = require('googleapis');
-    const client = googleAuth.getClient();
+    const client = await googleAuth.getClient();
     const oauth2 = google.oauth2({ version: 'v2', auth: client });
     const { data } = await oauth2.userinfo.get();
     return { success: true, profile: { name: data.name, picture: data.picture, email: data.email } };

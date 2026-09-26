@@ -39,6 +39,12 @@ class BrowserInteractionEngine {
         const interactiveElements = [];
         let idCounter = 1;
         
+        // Auto-dismiss cookie/consent banners if present
+        try {
+          const consentBtn = document.querySelector('ytd-consent-bump-v2-lightbox button, #dialog button[aria-label*="Accept"], button[aria-label*="Reject all"], button[aria-label*="Accept all"], button[aria-label*="Agree"]');
+          if (consentBtn) consentBtn.click();
+        } catch (_) {}
+
         // Remove old indicators
         document.querySelectorAll('.actra-virtual-cursor').forEach(e => e.remove());
 
@@ -103,6 +109,7 @@ class BrowserInteractionEngine {
     if (!screen || !screen.elements) return { elementId: null, candidates: [] };
     
     const desc = (targetDescription || '').toLowerCase().trim();
+    const isVideoTask = desc.includes('video') || desc.includes('thumbnail') || desc.includes('watch') || desc.includes('play') || (desc.includes('result') && screen.url && screen.url.includes('youtube.com'));
     
     // Exact match
     let exactMatches = screen.elements.filter(e => e.text && e.text.toLowerCase() === desc);
@@ -111,7 +118,7 @@ class BrowserInteractionEngine {
     let candidates = screen.elements;
     
     // Smarter Semantic Filtering
-    if (desc.includes('video') || desc.includes('thumbnail') || desc.includes('watch')) {
+    if (isVideoTask) {
       candidates = candidates.filter(e => e.tag === 'a' && (
         (e.href && (e.href.includes('watch') || e.href.includes('video'))) || 
         (e.text && (e.text.toLowerCase().includes('video') || e.text.toLowerCase().includes('watch')))
@@ -143,7 +150,7 @@ class BrowserInteractionEngine {
     // Disambiguate based on action type or semantic goal
     if (candidates.length > 1) {
       // If it's a video task, return the valid video link directly based on index
-      if (desc.includes('video') || desc.includes('thumbnail') || desc.includes('watch')) {
+      if (isVideoTask) {
         let best = candidates.filter(c => c.href && c.href.includes('/watch') && !c.href.includes('list='));
         
         let targetIndex = 0;
@@ -212,12 +219,12 @@ class BrowserInteractionEngine {
               cursor.style.backgroundColor = 'rgba(0, 150, 255, 0.5)';
               
               // Dispatch click
-              if (el.tagName.toLowerCase() === 'a' && el.href) {
-                el.click();
-              } else {
-                el.click();
-                el.focus();
-              }
+              el.scrollIntoView({ block: 'center' });
+              el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+              el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+              el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+              el.click();
+              if (el.focus) el.focus();
               
               // Fade out and remove cursor
               setTimeout(() => {
@@ -351,19 +358,24 @@ class BrowserInteractionEngine {
    */
   async clickAt(tabId, x, y) {
     const view = this._getView(tabId);
-    await view.webContents.executeJavaScript(`
+    
+    // Get the actual CSS coordinates based on devicePixelRatio
+    const coords = await view.webContents.executeJavaScript(`
       (() => {
-        const cssX = Math.round(${x} / window.devicePixelRatio);
-        const cssY = Math.round(${y} / window.devicePixelRatio);
-        const el = document.elementFromPoint(cssX, cssY);
-        if (el) {
-          el.focus();
-          el.click();
-          el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-          el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-        }
+        return {
+          cssX: Math.round(${x} / window.devicePixelRatio),
+          cssY: Math.round(${y} / window.devicePixelRatio)
+        };
       })();
     `);
+
+    // Use native input events for reliable interaction
+    view.webContents.sendInputEvent({ type: 'mouseMove', x: coords.cssX, y: coords.cssY });
+    await new Promise(r => setTimeout(r, 50));
+    view.webContents.sendInputEvent({ type: 'mouseDown', x: coords.cssX, y: coords.cssY, button: 'left', clickCount: 1 });
+    await new Promise(r => setTimeout(r, 50));
+    view.webContents.sendInputEvent({ type: 'mouseUp', x: coords.cssX, y: coords.cssY, button: 'left', clickCount: 1 });
+    
     return `Coordinate click at [${x}, ${y}]`;
   }
 
@@ -376,18 +388,12 @@ class BrowserInteractionEngine {
     // First click to focus
     await this.clickAt(tabId, x, y);
     
-    await view.webContents.executeJavaScript(`
-      (() => {
-        const cssX = Math.round(${x} / window.devicePixelRatio);
-        const cssY = Math.round(${y} / window.devicePixelRatio);
-        const el = document.elementFromPoint(cssX, cssY);
-        if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) {
-          el.value = ${JSON.stringify(text)};
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      })();
-    `);
+    // Wait a brief moment for the application state (e.g. React) to focus the element
+    await new Promise(r => setTimeout(r, 100));
+    
+    // Use native insertText instead of injecting JavaScript for better reliability
+    view.webContents.insertText(text);
+    
     return `Typed "${text}" at [${x}, ${y}]`;
   }
 }

@@ -26,6 +26,18 @@ class ApprovalEngine {
     return list;
   }
 
+  getPendingApproval(approvalId) {
+    const pending = this.pendingApprovals.get(approvalId);
+    return pending ? this._buildApprovalPayload(approvalId, pending.action, pending.context, pending.riskLevel) : null;
+  }
+
+  updatePendingAction(approvalId, action) {
+    const pending = this.pendingApprovals.get(approvalId);
+    if (!pending) return null;
+    pending.action = action;
+    return this._buildApprovalPayload(approvalId, pending.action, pending.context, pending.riskLevel);
+  }
+
   /**
    * Evaluate whether an action requires approval.
    * Returns { approved: bool, riskLevel: number, reason?: string }
@@ -109,6 +121,11 @@ class ApprovalEngine {
     } else if (action.name === 'create_doc') {
       summary = `Create Google Doc: "${args.title}"`;
       generatedContent = args.content ? args.content.slice(0, 500) + (args.content.length > 500 ? '...' : '') : '';
+    } else if (action.name === 'mcq_low_confidence_answer') {
+      const pct = args.confidence != null ? `${(Number(args.confidence) * 100).toFixed(0)}%` : 'low';
+      summary = `Low-confidence MCQ answer (${pct} confidence)`;
+      generatedContent = `Question: ${args.question || '(unknown)'}\n\nProposed answer: ${args.proposed_answer || '(unknown)'}\n\nReasoning: ${args.reasoning || '(none)'}`;
+      consequences = `The AI is only ${pct} confident in this answer. Review carefully before approving.`;
     }
 
     return {
@@ -118,6 +135,8 @@ class ApprovalEngine {
       context,
       summary,
       generatedContent,
+      htmlPreview: action.name === 'send_email' ? (args.html || null) : null,
+      isHtmlRequest: action.name === 'send_email' ? Boolean(args.htmlRequest || args.html) : false,
       recipients,
       riskLevel,
       reason: context?.reason || 'AI agent requested this action as part of your workflow.',

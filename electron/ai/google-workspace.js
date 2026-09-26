@@ -30,47 +30,154 @@ class GoogleWorkspaceEngine {
   // ─── GMAIL ────────────────────────────────────────────────────────────────
 
   /**
-   * Search Gmail for messages matching a query.
-   * @param {string} query - Gmail search query (e.g. "from:alice subject:proposal")
+   * Search Gmail for messages matching a query using multi-query parallel search.
+   * @param {string} query - Gmail search query
    * @param {number} maxResults
    */
-  async searchGmail(query, maxResults = 10) {
+  async searchGmail(query, maxResults = 25) {
     const auth = await this._requireAuth();
-    const res = await this.gmail.users.messages.list({
-      auth,
-      userId: 'me',
-      q: query,
-      maxResults,
-    });
 
-    const messages = res.data.messages || [];
-    if (messages.length === 0) return 'No emails found matching that query.';
+    // 1. Normalize and extract keywords
+    const rawQuery = (query || '').trim();
+    const cleanQuery = rawQuery.replace(/['"“”‘’]/g, ' ').replace(/\s+/g, ' ').trim();
+    
+    const stopwords = /^(is|there|any|mail|email|emails|mails|regarding|check|about|tell|me|did|i|clear|round|for|the|of|to|and|or|in|my|inbox|folder|label|labeled|show|get|all|related)$/i;
+    const keywords = cleanQuery.split(/\s+/).filter(w => w.length > 1 && !stopwords.test(w));
 
-    // Fetch snippet + metadata for each
-    const details = await Promise.all(
-      messages.slice(0, maxResults).map(m =>
-        this.gmail.users.messages.get({
+    // 2. Build multi-query search matrix for robust discovery
+    const searchQueries = new Set();
+    if (cleanQuery) {
+      searchQueries.add(cleanQuery);
+      if (cleanQuery.includes(' ')) {
+        searchQueries.add(`"${cleanQuery}"`);
+      }
+      if (keywords.length > 0) {
+        searchQueries.add(keywords.join(' '));
+        for (const kw of keywords) {
+          if (kw.length >= 3) {
+            searchQueries.add(kw);
+            searchQueries.add(`subject:${kw}`);
+          }
+        }
+      }
+    } else {
+      searchQueries.add('in:inbox');
+    }
+
+    console.log(`[GoogleWorkspace] Multi-query search running ${searchQueries.size} variations:`, Array.from(searchQueries));
+
+    // 3. Execute all search queries concurrently in parallel
+    const searchPromises = Array.from(searchQueries).map(async q => {
+      try {
+        const res = await this.gmail.users.messages.list({
           auth,
           userId: 'me',
-          id: m.id,
-          format: 'metadata',
-          metadataHeaders: ['Subject', 'From', 'Date'],
-        })
-      )
+          q,
+          maxResults: Math.max(maxResults, 20),
+        });
+        return res.data.messages || [];
+      } catch (err) {
+        console.warn(`[GoogleWorkspace] Gmail search failed for query "${q}":`, err.message);
+        return [];
+      }
+    });
+
+    const searchResults = await Promise.all(searchPromises);
+
+    // 4. Deduplicate message IDs
+    const seenIds = new Set();
+    const uniqueMessages = [];
+    for (const msgList of searchResults) {
+      for (const m of msgList) {
+        if (m.id && !seenIds.has(m.id)) {
+          seenIds.add(m.id);
+          uniqueMessages.push(m);
+        }
+      }
+    }
+
+    if (uniqueMessages.length === 0) {
+      return {
+        status: 'no_emails_found',
+        query_searched: cleanQuery,
+        queries_attempted: Array.from(searchQueries),
+        message: `No emails found in your inbox matching "${cleanQuery}".`
+      };
+    }
+
+    console.log(`[GoogleWorkspace] Found ${uniqueMessages.length} unique messages across queries.`);
+
+    // 5. Fetch full message details with complete bodies for top messages
+    const details = await Promise.all(
+      uniqueMessages.slice(0, Math.min(maxResults, 15)).map(async m => {
+        try {
+          const d = await this.gmail.users.messages.get({
+            auth,
+            userId: 'me',
+            id: m.id,
+            format: 'full',
+          });
+
+          const headers = d.data.payload?.headers || [];
+          const get = name => headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || '';
+
+          // Extract plain text body and HTML fallback
+          let body = '';
+          const extractBody = parts => {
+            if (!parts) return;
+            for (const part of parts) {
+              if (part.mimeType === 'text/plain' && part.body?.data && !body) {
+                body = Buffer.from(part.body.data, 'base64').toString('utf8');
+              } else if (part.mimeType === 'text/html' && part.body?.data && !body) {
+                const htmlText = Buffer.from(part.body.data, 'base64').toString('utf8');
+                body = htmlText.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+                               .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+                               .replace(/<[^>]*>/g, ' ')
+                               .replace(/&nbsp;/g, ' ')
+                               .replace(/&amp;/g, '&')
+                               .replace(/&lt;/g, '<')
+                               .replace(/&gt;/g, '>')
+                               .replace(/&quot;/g, '"')
+                               .replace(/\s+/g, ' ')
+                               .trim();
+              }
+              if (part.parts) extractBody(part.parts);
+            }
+          };
+
+          if (d.data.payload?.body?.data) {
+            body = Buffer.from(d.data.payload.body.data, 'base64').toString('utf8');
+          } else {
+            extractBody(d.data.payload?.parts);
+          }
+
+          const rawDate = get('Date');
+          const timestamp = d.data.internalDate ? parseInt(d.data.internalDate, 10) : (rawDate ? new Date(rawDate).getTime() : 0);
+
+          return {
+            id: d.data.id,
+            threadId: d.data.threadId,
+            subject: get('Subject') || '(No Subject)',
+            from: get('From'),
+            to: get('To'),
+            date: rawDate,
+            timestamp,
+            snippet: d.data.snippet,
+            body: (body || d.data.snippet || '').trim(),
+          };
+        } catch (fetchErr) {
+          console.warn(`[GoogleWorkspace] Failed to fetch message ${m.id}:`, fetchErr.message);
+          return null;
+        }
+      })
     );
 
-    return details.map(d => {
-      const headers = d.data.payload?.headers || [];
-      const get = name => headers.find(h => h.name === name)?.value || '';
-      return {
-        id: d.data.id,
-        threadId: d.data.threadId,
-        subject: get('Subject'),
-        from: get('From'),
-        date: get('Date'),
-        snippet: d.data.snippet,
-      };
-    });
+    const validDetails = details.filter(Boolean);
+
+    // 6. Sort chronologically from newest to oldest
+    validDetails.sort((a, b) => b.timestamp - a.timestamp);
+
+    return validDetails;
   }
 
   /**
@@ -123,16 +230,37 @@ class GoogleWorkspaceEngine {
   /**
    * Send an email via Gmail API.
    */
-  async sendEmail(to, subject, body) {
+  async sendEmail(to, subject, body, html) {
     const auth = await this._requireAuth();
+
+    const escapeHtml = value => String(value || '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    const sanitizeHtml = value => String(value || '')
+      .replace(/<\/?(script|style|iframe|object|embed|form)[^>]*>/gi, '')
+      .replace(/\s+on[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+      .replace(/javascript\s*:/gi, '')
+      .replace(/<meta[^>]*>/gi, '')
+      .replace(/<link[^>]*>/gi, '');
+    const plainText = String(body || '');
+    const htmlBody = sanitizeHtml(html || `<p>${escapeHtml(plainText).replace(/\n/g, '<br>')}</p>`);
+    const boundary = `ActraBoundary${Date.now()}`;
 
     const message = [
       `To: ${to}`,
       `Subject: ${subject}`,
       'MIME-Version: 1.0',
+      `Content-Type: multipart/alternative; boundary="${boundary}"`,
+      '',
+      `--${boundary}`,
       'Content-Type: text/plain; charset="UTF-8"',
       '',
-      body,
+      plainText,
+      `--${boundary}`,
+      'Content-Type: text/html; charset="UTF-8"',
+      '',
+      htmlBody,
+      `--${boundary}--`,
     ].join('\n');
 
     const encodedMessage = Buffer.from(message)

@@ -26,6 +26,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
   duplicateTab:    (tabId) => ipcRenderer.invoke('tab:duplicate', tabId),
   isFullscreen:    () => ipcRenderer.invoke('window:isFullscreen'),
   requestMicAccess:() => ipcRenderer.invoke('window:requestMicAccess'),
+  installUpdate:   () => ipcRenderer.invoke('updater:install'),
+  getLocalModelStatus: () => ipcRenderer.invoke('local-models:get-status'),
+  downloadLocalModels: () => ipcRenderer.invoke('local-models:download'),
+
+  onUpdaterStatus: (cb) => {
+    ipcRenderer.removeAllListeners('updater:status');
+    ipcRenderer.on('updater:status', (_, data) => cb(data));
+  },
+  onLocalModelsStatus: (cb) => {
+    ipcRenderer.removeAllListeners('local-models:status');
+    ipcRenderer.on('local-models:status', (_, data) => cb(data));
+  },
 
   // ─── Tab Events ──────────────────────────────────────────────────────────
   onTabUpdated: (cb) => {
@@ -47,6 +59,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onNewTabCreated: (cb) => {
     ipcRenderer.removeAllListeners('new-tab-created');
     ipcRenderer.on('new-tab-created', (_, data) => cb(data));
+  },
+  onTabActivated: (cb) => {
+    ipcRenderer.removeAllListeners('tab-activated');
+    ipcRenderer.on('tab-activated', (_, data) => cb(data));
   },
   onTabCrashed: (cb) => {
     ipcRenderer.removeAllListeners('tab-crashed');
@@ -92,7 +108,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onMenuToggleDevtools:     (cb) => { ipcRenderer.removeAllListeners('menu:toggle-devtools');      ipcRenderer.on('menu:toggle-devtools', () => cb()); },
 
   // ─── AI Platform APIs ─────────────────────────────────────────────────────
-  sendChatMessage: (command, activeTabId) => ipcRenderer.invoke('ai:send-chat-message', command, activeTabId),
+  sendChatMessage: (command, activeTabId, mcqModel) => ipcRenderer.invoke('ai:send-chat-message', command, activeTabId, mcqModel),
   getChatHistory:  () => ipcRenderer.invoke('ai:get-chat-history'),
   clearChat:       () => ipcRenderer.invoke('ai:clear-chat'),
   cancelTask:      (taskId) => ipcRenderer.invoke('ai:cancel-task', taskId),
@@ -103,6 +119,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   /** Edit an action's args and approve it */
   editApproval: (approvalId, newArgs) => ipcRenderer.invoke('ai:edit-approval', approvalId, newArgs),
+  enhanceApproval: (approvalId) => ipcRenderer.invoke('ai:enhance-approval', approvalId),
 
   getCompanions: () => ipcRenderer.invoke('ai:get-companions'),
   getTasks:      () => ipcRenderer.invoke('ai:get-tasks'),
@@ -119,6 +136,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onAIRequireApproval: (cb) => {
     ipcRenderer.removeAllListeners('ai:require-approval');
     ipcRenderer.on('ai:require-approval', (_, data) => cb(data));
+  },
+  onAIApprovalUpdated: (cb) => {
+    ipcRenderer.removeAllListeners('ai:approval-updated');
+    ipcRenderer.on('ai:approval-updated', (_, data) => cb(data));
   },
   onAITaskUpdate: (cb) => {
     ipcRenderer.removeAllListeners('ai:task-update');

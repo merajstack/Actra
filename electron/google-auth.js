@@ -1,9 +1,29 @@
 const { google } = require('googleapis');
 
-const { shell } = require('electron');
+const { app, shell } = require('electron');
 const http = require('http');
 const url = require('url');
+const fs = require('fs');
+const path = require('path');
 const supabase = require('./supabase');
+
+function getOAuthCredentials() {
+  let clientId = process.env.GOOGLE_CLIENT_ID;
+  let clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+  if ((!clientId || !clientSecret) && app.isPackaged) {
+    try {
+      const configPath = path.join(process.resourcesPath, 'actra-config', 'google-oauth.json');
+      const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      clientId = clientId || config.clientId;
+      clientSecret = clientSecret || config.clientSecret;
+    } catch (error) {
+      console.warn('[GoogleAuth] Packaged OAuth config could not be loaded:', error.message);
+    }
+  }
+
+  return { clientId, clientSecret };
+}
 
 class GoogleAuth {
   constructor() {
@@ -23,8 +43,7 @@ class GoogleAuth {
   }
 
   async _initClient() {
-    const clientId = process.env.GOOGLE_CLIENT_ID;
-    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+    const { clientId, clientSecret } = getOAuthCredentials();
 
     if (!clientId || !clientSecret || clientId === 'YOUR_GOOGLE_CLIENT_ID') {
       throw new Error('Google OAuth credentials missing in .env (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)');

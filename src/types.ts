@@ -130,6 +130,10 @@ export interface AIApprovalRequest {
   summary?: string;
   /** For emails: the draft body to preview */
   generatedContent?: string;
+  /** Sanitized HTML draft rendered in the approval card */
+  htmlPreview?: string | null;
+  /** True when the user explicitly requested a designed/HTML email */
+  isHtmlRequest?: boolean;
   /** External parties that will be affected */
   recipients?: string[];
   /** Risk classification 0=low, 1=medium, 2=high */
