@@ -20,7 +20,7 @@ const MODELS = {
   // Fast 70B — everyday chat, Gmail summarization, page extraction
   chat:    '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
   // Dedicated reasoning — multi-step agentic plans, tool selection, complex tasks
-  planner: '@cf/qwen/qwq-32b',
+  planner: '@cf/openai/gpt-oss-120b',
   // Best-in-class coding — code gen, debug, GitHub README, technical Q&A
   coding:  '@cf/qwen/qwen2.5-coder-32b-instruct',
   // Multimodal MoE — screenshot analysis, MCQ solving, UI-TARS visual_interact
@@ -775,7 +775,6 @@ class ModelGateway {
     }
     // Guard: ensure text-only models are never sent image payloads
     const textOnlyModels = [
-      '@cf/qwen/qwq-32b',
       '@cf/qwen/qwen2.5-coder-32b-instruct',
       '@cf/openai/gpt-oss-120b',
       MODELS.chat,

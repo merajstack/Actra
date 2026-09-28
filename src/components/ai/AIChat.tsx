@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import {
   X, Sparkles, CheckCircle2, AlertTriangle, Play, Loader2, Send, Mic,
-  User, Bot, ChevronUp, ChevronDown, CheckCheck, Check, Pencil, Ban, Trash2, StopCircle, MailOpen, Calendar, Sheet, FileText, Search, Database, Zap, Maximize2, Minimize2, BookOpen, Cpu, Code2
+  User, Bot, ChevronUp, ChevronDown, CheckCheck, Check, Pencil, Ban, Trash2, StopCircle, MailOpen, Calendar, Sheet, FileText, Search, Database, Zap, Maximize2, Minimize2, BookOpen, Code2
 } from 'lucide-react';
 import { AITask, AIApprovalRequest, ChatSession, ChatMessage } from '../../types';
 
@@ -14,14 +14,6 @@ const MCQ_SUBJECTS = [
     modelName: 'gpt-oss-120b',
     icon: BookOpen,
     description: 'Verbal reasoning, reading comprehension & general knowledge',
-  },
-  {
-    label: 'Aptitude / Maths / DSA',
-    shortLabel: 'Aptitude / Maths',
-    model: '@cf/qwen/qwq-32b',
-    modelName: 'qwq-32b',
-    icon: Cpu,
-    description: 'Deep mathematical reasoning, quantitative & DSA',
   },
   {
     label: 'Coding / Web Dev',

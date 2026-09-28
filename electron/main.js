@@ -587,7 +587,7 @@ async function executeAICommand(command, activeTabId, mcqModel) {
       }
 
       // ── FAST PATH 2: Browser action — skip planner, go directly to BrowserAgent
-      // This prevents qwq-32b from misclassifying browser tasks as INFORMATIONAL
+      // This prevents planner models from misclassifying browser tasks as INFORMATIONAL
       if (isLikelyBrowserAction(command)) {
         taskManager.updateTaskStatus(task.id, 'executing');
         try {

@@ -2,7 +2,7 @@
   "name": "actra-browser",
   "private": true,
   "productName": "Actra",
-  "version": "1.4.8",
+  "version": "1.4.9",
   "description": "Actra desktop browser",
   "author": "Merajstack",
   "main": "electron/main.js",
