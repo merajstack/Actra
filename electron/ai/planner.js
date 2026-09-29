@@ -326,6 +326,216 @@ CRITICAL: Output only raw valid JSON. Do NOT wrap in markdown code fences.`;
 
     return Array.isArray(data?.answers) ? data.answers : [];
   }
+
+  /**
+   * Intent parsing for human-like web tasks.
+   * Converts commands like "open amazon and find me blue watches under 5k, delivery under 1 week and add it to cart"
+   * into a structured intent object with a short keyword search_query, isolated constraints, and final_action.
+   *
+   * @param {string} command
+   * @returns {Promise<{ site: string, search_query: string, constraints: Array, final_action: string }>}
+   */
+  async parseWebTaskIntent(command) {
+    if (this.modelGateway.getLastQuotaError && this.modelGateway.getLastQuotaError()) {
+      throw this.modelGateway.getLastQuotaError();
+    }
+
+    const schema = {
+      type: 'object',
+      properties: {
+        site: {
+          type: 'string',
+          description: 'The target website name, domain, or URL as named by the user (e.g. "amazon", "flipkart", "myntra", "ebay", "target", "youtube", "netflix", or ANY website or URL mentioned). Never restrict to a fixed list.',
+        },
+        search_query: {
+          type: 'string',
+          description: 'SHORT search query strictly 2-5 keywords (e.g. "blue watch", "white sneakers", "mr beast"). NEVER include constraints, price limits, delivery times, or action verbs in this field.',
+        },
+        constraints: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              type:  { type: 'string', description: 'Constraint type, e.g. "max_price", "min_price", "delivery_days", "brand", "color", "rating"' },
+              value: { description: 'Target value for the constraint, e.g. 5000, 7, "Casio", 4.0' },
+              max:   { type: 'number', description: 'Upper numeric bound if applicable (e.g. 5000, 7)' },
+              min:   { type: 'number', description: 'Lower numeric bound if applicable' },
+              unit:  { type: 'string', description: 'Unit if applicable, e.g. "INR", "USD", "days"' },
+              raw:   { type: 'string', description: 'Raw phrase from the command describing the constraint' },
+            },
+            required: ['type'],
+          },
+          description: 'List of filters or constraints to be applied via filter UI or verified on product page.',
+        },
+        final_action: {
+          type: 'string',
+          description: 'The final action to perform once the target item/content is found: "add_to_cart" | "play_video" | "open" | "extract_info" | "click_result"',
+        },
+      },
+      required: ['site', 'search_query', 'constraints', 'final_action'],
+    };
+
+    const prompt = `You are a human-like web task intent parser.
+Convert the user command into a structured JSON web task specification.
+
+CRITICAL INSTRUCTIONS:
+1. "site": Extract whatever website name or URL the user specified (e.g. "amazon", "flipkart", "myntra", "ebay", "walmart", "target", "bestbuy", "youtube", "vimeo", or any other shopping, video, or general website or domain/URL). Do NOT restrict to any fixed list.
+2. "search_query" MUST be SHORT (strictly 2 to 5 keywords, e.g. "blue watch", "white sneakers", "sony wh-1000xm5", "mechanical keyboard", "mr beast").
+   NEVER put constraints ("under 5k", "delivery under 1 week", "less than $50") or action words ("open", "find me", "look for", "add to cart", "play") in search_query! A human only enters clean keywords into the search box.
+3. Put all conditions into the "constraints" array:
+   - Price limit: { "type": "max_price", "value": 5000, "max": 5000 }
+   - Delivery limit: { "type": "delivery_days", "value": 7, "max": 7 } (e.g. "under 1 week" = 7 days)
+   - Other filters: { "type": "brand"|"color"|"rating", "value": "..." }
+4. "final_action": "add_to_cart" | "play_video" | "open" | "extract_info" | "click_result"
+
+User Command: "${command}"
+
+CRITICAL: Output raw JSON only matching the schema.`;
+
+    let parsed = null;
+    if (this.modelGateway && this.modelGateway.isAvailable()) {
+      try {
+        const { data } = await this.modelGateway.structuredOutput(prompt, schema, {
+          temperature: 0.1,
+          role: 'chat', // Cheap and fast model call
+        });
+        if (data && data.site && data.search_query) {
+          parsed = data;
+        }
+      } catch (err) {
+        if (this.modelGateway.getLastQuotaError && this.modelGateway.getLastQuotaError()) {
+          throw this.modelGateway.getLastQuotaError();
+        }
+        console.warn('[PlannerEngine] parseWebTaskIntent LLM call failed, using rule-based parser:', err.message);
+      }
+    }
+
+    if (!parsed) {
+      parsed = PlannerEngine._parseWebTaskIntentFallback(command);
+    }
+
+    // Clean up search_query: enforce that NO action words or constraint phrases leak into the search query
+    if (parsed && typeof parsed.search_query === 'string') {
+      parsed.search_query = PlannerEngine._cleanSearchQuery(parsed.search_query);
+    }
+
+    return parsed;
+  }
+
+  /**
+   * Sanitizes a search query string to ensure it contains only 2-5 clean keywords
+   * and never contains action verbs or constraint phrases.
+   */
+  static _cleanSearchQuery(rawQuery) {
+    let q = (rawQuery || '').trim();
+    // Strip leading navigation patterns: "open [site] and", "go to [site] and", "visit [site] and"
+    q = q.replace(/^(?:(?:open|go\s+to|navigate\s+to|visit|launch|load)\s+(?:https?:\/\/[^\s]+|[a-zA-Z0-9.-]+(?:\.[a-zA-Z]{2,})?|[a-zA-Z0-9_-]+)\s*(?:and\s+)?)/i, '');
+    // Strip leading action verbs: "find me", "search for", "look for", "open", "play"
+    q = q.replace(/^(?:find\s+(?:me\s+)?|search\s+(?:for\s+)?|look\s+(?:up|for)\s+|play\s+|watch\s+|buy\s+|get\s+(?:me\s+)?)/i, '');
+    // Strip price constraints: "under 5k", "less than $50", "below 5000", "budget 5k"
+    q = q.replace(/\b(?:under|less\s+than|below|within|budget(?:\s+of)?)\s*[\$₹£€]?\s*\d+(?:,\d+)*(?:\.\d+)?k?\b/gi, '');
+    // Strip delivery constraints: "delivery under 1 week", "delivery in 2 days", "delivery within 3 days"
+    q = q.replace(/\b(?:delivery|shipping|arrive)\s+(?:under|in|within|less\s+than)\s+\d+\s*(?:days?|weeks?|hrs?|hours?)\b/gi, '');
+    q = q.replace(/\bunder\s+\d+\s*(?:days?|weeks?)\b/gi, '');
+    // Strip trailing action phrases: "and add it to cart", "add to cart", "and play it"
+    q = q.replace(/\b(?:and\s+)?add\s+(?:it\s+)?to\s+cart\b/gi, '');
+    q = q.replace(/\b(?:and\s+)?play\s+(?:it|video)\b/gi, '');
+    // Strip punctuation and extra spaces
+    q = q.replace(/[,;:.!?]/g, ' ').replace(/\s+/g, ' ').trim();
+
+    // Ensure 2-5 keywords max
+    const words = q.split(/\s+/).filter(Boolean);
+    if (words.length > 5) {
+      q = words.slice(0, 5).join(' ');
+    }
+    return q || rawQuery;
+  }
+
+  /**
+   * Heuristic/deterministic fallback parser for web task intents
+   * if the LLM call is unavailable or fails.
+   */
+  static _parseWebTaskIntentFallback(command) {
+    const c = (command || '').trim();
+    const lower = c.toLowerCase();
+
+    // Detect site generically from the command
+    let site = 'web';
+    const urlMatch = c.match(/https?:\/\/([^\/\s]+)/i);
+    if (urlMatch) {
+      site = urlMatch[1].replace(/^www\./i, '');
+    } else {
+      // Look for "open/go to/navigate to/visit/launch [site]"
+      const navMatch = c.match(/\b(?:open|go\s+to|navigate\s+to|visit|launch|load)\s+([a-zA-Z0-9.-]+(?:\.[a-zA-Z]{2,})?|[a-zA-Z0-9_-]+)/i);
+      // Look for "on/in/at [site]"
+      const onMatch = c.match(/\b(?:on|in|at)\s+([a-zA-Z0-9.-]+(?:\.[a-zA-Z]{2,})?|[a-zA-Z0-9_-]+)(?:\s|$|[.!?])/i);
+      const stopWords = new Set(['the', 'a', 'an', 'my', 'this', 'me', 'some', 'any', 'new', 'tab']);
+
+      if (navMatch && !stopWords.has(navMatch[1].toLowerCase())) {
+        site = navMatch[1].toLowerCase().replace(/^www\./i, '');
+      } else if (onMatch && !stopWords.has(onMatch[1].toLowerCase())) {
+        site = onMatch[1].toLowerCase().replace(/^www\./i, '');
+      } else {
+        const commonSiteMatch = lower.match(/\b(amazon|flipkart|myntra|ebay|walmart|target|bestbuy|aliexpress|youtube|netflix|spotify|google|reddit)\b/i);
+        if (commonSiteMatch) {
+          site = commonSiteMatch[1].toLowerCase();
+        }
+      }
+    }
+
+    // Detect constraints
+    const constraints = [];
+
+    // 1. Max price: "under 5k", "under $50", "below 5000"
+    const priceMatch = lower.match(/\b(?:under|less\s+than|below|within|budget\s+of)\s*([\$₹£€]?\s*(\d+(?:,\d+)*(?:\.\d+)?)(k)?)\b/i);
+    if (priceMatch) {
+      let num = parseFloat(priceMatch[2].replace(/,/g, ''));
+      if (priceMatch[3]) num *= 1000;
+      constraints.push({
+        type: 'max_price',
+        value: num,
+        max: num,
+        raw: priceMatch[0],
+      });
+    }
+
+    // 2. Delivery days: "delivery under 1 week", "delivery in 2 days"
+    const deliveryMatch = lower.match(/\b(?:delivery|shipping|arrive)\s+(?:under|in|within|less\s+than)\s+(\d+)\s*(days?|weeks?)\b/i) ||
+                          lower.match(/\bunder\s+(\d+)\s*(days?|weeks?)\s*(?:delivery)?\b/i);
+    if (deliveryMatch) {
+      let days = parseInt(deliveryMatch[1], 10);
+      const unit = (deliveryMatch[2] || '').toLowerCase();
+      if (unit.startsWith('week')) days *= 7;
+      constraints.push({
+        type: 'delivery_days',
+        value: days,
+        max: days,
+        unit: 'days',
+        raw: deliveryMatch[0],
+      });
+    }
+
+    // Detect final action
+    let final_action = 'open';
+    if (/\badd\s+(?:it\s+)?to\s+cart\b/i.test(lower)) {
+      final_action = 'add_to_cart';
+    } else if (/\b(?:play|watch)\b/i.test(lower)) {
+      final_action = 'play_video';
+    }
+
+    // Extract search query
+    let search_query = PlannerEngine._cleanSearchQuery(c);
+    // Remove site name from query if present
+    search_query = search_query.replace(new RegExp(`\\b${site}\\b`, 'gi'), '').trim();
+    if (!search_query) search_query = 'item';
+
+    return {
+      site,
+      search_query,
+      constraints,
+      final_action,
+    };
+  }
 }
 
 module.exports = PlannerEngine;

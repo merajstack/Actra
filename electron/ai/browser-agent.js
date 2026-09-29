@@ -15,6 +15,11 @@ try {
   PlannerEngine = require('./planner');
 } catch (_) {}
 
+let WebTaskAgent;
+try {
+  ({ WebTaskAgent } = require('./web-task-agent'));
+} catch (_) {}
+
 const BROWSER_PLANNER_TOOLS = [
   {
     name: 'browser_navigate',
@@ -161,6 +166,58 @@ function isMcqCommand(command) {
     || /\b(mcq|mcqs|quiz|question|answer|option)\b.*\bone by one\b/i.test(t)
     || /\b(solve|answer)\b.*\b(one by one|one-by-one)\b/i.test(t)
     || /\b(solve|answer)\b.*\b(mcq|mcqs|quiz)\b/i.test(t);
+}
+
+/**
+ * Returns true when the user command is a web task (shopping, finding items with
+ * constraints, adding to cart, or media playback across ANY site or URL).
+ *
+ * Evaluates semantic signals and syntactic task shape — NOT a hardcoded whitelist of sites.
+ */
+function isWebTaskCommand(command) {
+  if (isMcqCommand(command)) return false;
+  const c = (command || '').trim().toLowerCase();
+
+  // 1. Explicit constraints (price limits, delivery timelines, ratings, sorting/filters)
+  const hasConstraints = /\b(?:under|less\s+than|below|within|budget(?:\s+of)?)\s*[\$₹£€]?\s*\d+k?\b/i.test(c) ||
+                         /\b(?:delivery|shipping|arrive)\s+(?:under|in|within|less\s+than)\b/i.test(c) ||
+                         /\bunder\s+\d+\s*(?:days?|weeks?)\b/i.test(c) ||
+                         /\b(?:rated?|stars?)\s*(?:above|over|>=)?\s*\d/i.test(c) ||
+                         /\b(?:filter\s+by|sort(?:ed)?\s+by|cheapest|highest\s+rated)\b/i.test(c);
+
+  // 2. Shopping / Cart / Order actions
+  const hasCartOrOrder = /\b(?:add\s+(?:it\s+)?to\s+cart|cart|buy|order|purchase)\b/i.test(c);
+
+  // 3. Media playback actions
+  const hasMediaPlay = /\b(?:play|watch)\s+/i.test(c);
+
+  // 4. Product discovery verbs
+  const hasDiscovery = /\b(?:find\s+(?:me)?|search(?:\s+for)?|look\s+(?:up|for)|get\s+(?:me)?|show\s+(?:me)?)\b/i.test(c);
+
+  // 5. Compound site navigation shape: "open/go to/visit [site] and [action]..."
+  const hasCompoundNav = /\b(?:open|go\s+to|navigate\s+to|visit|launch)\s+([a-zA-Z0-9.-]+(?:\.[a-zA-Z]{2,})?|[a-zA-Z0-9_-]+)\b.*?\band\s+(?:find|search|look|get|buy|add|play|watch)/i.test(c);
+
+  // Rule 1: Any constrained task (price, delivery, rating) combined with discovery, cart, or navigation
+  if (hasConstraints && (hasDiscovery || hasCartOrOrder || hasCompoundNav)) {
+    return true;
+  }
+
+  // Rule 2: Explicit cart actions ("add to cart", "add it to cart")
+  if (hasCartOrOrder && (hasDiscovery || hasCompoundNav || hasConstraints)) {
+    return true;
+  }
+
+  // Rule 3: Compound media play on any site ("open vimeo and play jazz", "play lo fi on soundcloud")
+  if (hasMediaPlay && (hasCompoundNav || /\b(?:on|in|at)\s+([a-zA-Z0-9.-]+)/i.test(c))) {
+    return true;
+  }
+
+  // Rule 4: Compound navigation with product search or cart ("open myntra and find white sneakers")
+  if (hasCompoundNav) {
+    return true;
+  }
+
+  return false;
 }
 
 // ─── Rule-based Task Decomposer ─────────────────────────────────────────────
@@ -315,9 +372,12 @@ class TaskDecomposer {
   }
 
   /** Build a search+interact plan for a given site and query. */
-  static _buildSearchPlan(siteName, query, originalCommand) {
+  static _buildSearchPlan(siteName, rawQuery, originalCommand) {
     const isPlay   = /\bplay\b|\bwatch\b/i.test(originalCommand);
     const siteUrl  = SITES[siteName];
+    const query    = (PlannerEngine && typeof PlannerEngine._cleanSearchQuery === 'function')
+      ? PlannerEngine._cleanSearchQuery(rawQuery)
+      : rawQuery;
 
     if (siteName === 'youtube') {
       return {
@@ -449,6 +509,17 @@ class BrowserAgent {
     // Optional approval engine for low-confidence MCQ gates
     this._approvalEngine          = deps.approvalEngine || null;
 
+    // Autonomous web task agent for perception-driven shopping & media tasks
+    this.webTaskAgent             = deps.webTaskAgent || (WebTaskAgent ? new WebTaskAgent({
+      tabManager: this.tabManager,
+      taskManager: this.taskManager,
+      chatManager: this.chatManager,
+      auditLog: this.auditLog,
+      modelGateway: this.modelGateway,
+      browserInteractionEngine: this.browserInteractionEngine,
+      approvalEngine: this._approvalEngine,
+    }) : null);
+
     // Pre-warm local vision server in background if configured
     this._prewarmVisionServer();
   }
@@ -530,339 +601,433 @@ class BrowserAgent {
   }
 
   async execute(command, activeTabId, task, assistantMsg, auditEntryId, mcqModel) {
-    // Determine which tab to target.
-    // Supports explicit tab instructions e.g. "from tab 1", "tab 2", "tab one", etc.
-    let targetTabId = activeTabId || this.tabManager.activeTabId;
-    let explicitTabSpecified = false;
-    const tabMatch = (command || '').match(/\btab\s*(?:(?:number|#)\s*)?(\d+|one|two|three|four|five|six|seven|eight|nine)\b/i);
-    if (tabMatch) {
-      const tabNumMap = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9 };
-      const parsedNum = parseInt(tabMatch[1], 10) || tabNumMap[tabMatch[1].toLowerCase()] || 1;
-      const tabIndex = Math.max(0, parsedNum - 1);
-      if (this.tabManager.tabOrder && this.tabManager.tabOrder[tabIndex]) {
-        targetTabId = this.tabManager.tabOrder[tabIndex];
-        explicitTabSpecified = true;
+    let executionError = null;
+    try {
+      // Determine which tab to target.
+      // Supports explicit tab instructions e.g. "from tab 1", "tab 2", "tab one", etc.
+      let targetTabId = activeTabId || this.tabManager.activeTabId;
+      let explicitTabSpecified = false;
+      const tabMatch = (command || '').match(/\btab\s*(?:(?:number|#)\s*)?(\d+|one|two|three|four|five|six|seven|eight|nine)\b/i);
+      if (tabMatch) {
+        const tabNumMap = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9 };
+        const parsedNum = parseInt(tabMatch[1], 10) || tabNumMap[tabMatch[1].toLowerCase()] || 1;
+        const tabIndex = Math.max(0, parsedNum - 1);
+        if (this.tabManager.tabOrder && this.tabManager.tabOrder[tabIndex]) {
+          targetTabId = this.tabManager.tabOrder[tabIndex];
+          explicitTabSpecified = true;
+        }
+      } else if (!targetTabId && this.tabManager.tabOrder?.[0]) {
+        targetTabId = this.tabManager.tabOrder[0];
       }
-    } else if (!targetTabId && this.tabManager.tabOrder?.[0]) {
-      targetTabId = this.tabManager.tabOrder[0];
-    }
 
-    if (!this.tabManager.tabs.has(targetTabId)) {
-      targetTabId = this.tabManager.activeTabId || this.tabManager.tabOrder?.[0];
-    }
-
-    if (!this.tabManager.tabs.has(targetTabId)) {
-      throw new Error('Tab is not available or closed.');
-    }
-
-    this.taskManager.updateTaskStatus(task.id, 'executing');
-    this._prewarmVisionServer();
-
-    // Fail fast if model quota is known to be exhausted
-    if (this.modelGateway?.isQuotaExhausted && this.modelGateway.isQuotaExhausted()) {
-      const quotaErr = this.modelGateway.getLastQuotaError();
-      this.taskManager.updateTaskStatus(task.id, 'failed', { error: quotaErr?.message });
-      if (assistantMsg?.id) {
-        await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${quotaErr?.message}` });
+      if (!this.tabManager.tabs.has(targetTabId)) {
+        targetTabId = this.tabManager.activeTabId || this.tabManager.tabOrder?.[0];
       }
-      throw quotaErr;
-    }
 
-    // ── Phase 0: Pronoun resolution (zero LLM if no pronouns detected) ──────
-    command = await this._resolvePronouns(command);
+      if (!this.tabManager.tabs.has(targetTabId)) {
+        throw new Error('Tab is not available or closed.');
+      }
 
-    // ── Phase 0.5: MCQ routing — sequential or batch ──────────────────────────
-    if (isMcqCommand(command)) {
-      // 1. Dynamic MCQ Tab Discovery: if user didn't specify a tab (e.g. "from tab 2"),
-      // check if targetTabId has MCQs. If not, inspect other open tabs to find the quiz tab.
-      if (!explicitTabSpecified) {
-        const mcqTab = await this._findMcqTab(targetTabId);
-        if (mcqTab?.tabId && mcqTab.tabId !== targetTabId && mcqTab.hasMCQs) {
-          console.log(`[BrowserAgent] Switching to tab with MCQs: ${mcqTab.tabId} ("${mcqTab.title}" - ${mcqTab.url})`);
-          targetTabId = mcqTab.tabId;
+      this.taskManager.updateTaskStatus(task.id, 'executing');
+      this._prewarmVisionServer();
+
+      // Fail fast if model quota is known to be exhausted
+      if (this.modelGateway?.isQuotaExhausted && this.modelGateway.isQuotaExhausted()) {
+        const quotaErr = this.modelGateway.getLastQuotaError();
+        this.taskManager.updateTaskStatus(task.id, 'failed', { error: quotaErr?.message });
+        if (assistantMsg?.id) {
+          await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${quotaErr?.message}`, isLoading: false, streaming: false });
+        }
+        throw quotaErr;
+      }
+
+      // ── Phase 0: Pronoun resolution (zero LLM if no pronouns detected) ──────
+      command = await this._resolvePronouns(command);
+
+      // ── Phase 0.5: MCQ routing — sequential or batch ──────────────────────────
+      if (isMcqCommand(command)) {
+        // 1. Dynamic MCQ Tab Discovery: if user didn't specify a tab (e.g. "from tab 2"),
+        // check if targetTabId has MCQs. If not, inspect other open tabs to find the quiz tab.
+        if (!explicitTabSpecified) {
+          const mcqTab = await this._findMcqTab(targetTabId);
+          if (mcqTab?.tabId && mcqTab.tabId !== targetTabId && mcqTab.hasMCQs) {
+            console.log(`[BrowserAgent] Switching to tab with MCQs: ${mcqTab.tabId} ("${mcqTab.title}" - ${mcqTab.url})`);
+            targetTabId = mcqTab.tabId;
+            this.tabManager.setActiveTab(targetTabId);
+            const v = this.tabManager.tabs.get(targetTabId);
+            if (v) {
+              try { this.tabManager.updateViewBounds(v); } catch {}
+              try { v.webContents.focus(); } catch {}
+            }
+            this.taskManager.addStep(
+              task.id,
+              `📑 Located MCQ quiz in tab: "${mcqTab.title || targetTabId}" — switched tab`,
+              'completed',
+              'navigate'
+            );
+          }
+        } else {
           this.tabManager.setActiveTab(targetTabId);
           const v = this.tabManager.tabs.get(targetTabId);
           if (v) {
             try { this.tabManager.updateViewBounds(v); } catch {}
             try { v.webContents.focus(); } catch {}
           }
+          const activeIdx = this.tabManager.tabOrder ? this.tabManager.tabOrder.indexOf(targetTabId) + 1 : 1;
           this.taskManager.addStep(
             task.id,
-            `📑 Located MCQ quiz in tab: "${mcqTab.title || targetTabId}" — switched tab`,
+            `📑 Targeting Tab ${activeIdx} for MCQ solving`,
             'completed',
             'navigate'
           );
         }
-      } else {
-        this.tabManager.setActiveTab(targetTabId);
-        const v = this.tabManager.tabs.get(targetTabId);
-        if (v) {
-          try { this.tabManager.updateViewBounds(v); } catch {}
-          try { v.webContents.focus(); } catch {}
+
+        // Invalidate detection cache now that we're handling a fresh request
+        if (this.pageContextEngine?.clearMCQDetectionCache) {
+          this.pageContextEngine.clearMCQDetectionCache(targetTabId);
         }
-        const activeIdx = this.tabManager.tabOrder ? this.tabManager.tabOrder.indexOf(targetTabId) + 1 : 1;
-        this.taskManager.addStep(
-          task.id,
-          `📑 Targeting Tab ${activeIdx} for MCQ solving`,
-          'completed',
-          'navigate'
-        );
+
+        // Detect quiz mode details
+        const seqDetect = this.pageContextEngine?.detectSequentialQuizMode
+          ? await this.pageContextEngine.detectSequentialQuizMode(targetTabId).catch(() => ({ isSequential: true, optionCount: 0, timerText: '' }))
+          : { isSequential: true, optionCount: 0, timerText: '' };
+
+        // Route all MCQ commands to the continuous quiz solver that loops through all questions,
+        // captures screenshot previews for the chat, and answers fast via DOM + LLM
+        await this._solveSequentialQuiz(targetTabId, task, assistantMsg, auditEntryId, command, seqDetect, mcqModel);
+        return;
       }
 
-      // Invalidate detection cache now that we're handling a fresh request
-      if (this.pageContextEngine?.clearMCQDetectionCache) {
-        this.pageContextEngine.clearMCQDetectionCache(targetTabId);
-      }
-
-      // Detect quiz mode details
-      const seqDetect = this.pageContextEngine?.detectSequentialQuizMode
-        ? await this.pageContextEngine.detectSequentialQuizMode(targetTabId).catch(() => ({ isSequential: true, optionCount: 0, timerText: '' }))
-        : { isSequential: true, optionCount: 0, timerText: '' };
-
-      // Route all MCQ commands to the continuous quiz solver that loops through all questions,
-      // captures screenshot previews for the chat, and answers fast via DOM + LLM
-      await this._solveSequentialQuiz(targetTabId, task, assistantMsg, auditEntryId, command, seqDetect, mcqModel);
-      return;
-    }
-
-    let plan = TaskDecomposer.decompose(command);
-    // Append extract_and_report step if user wants info summarized to chat
-    if (plan) plan = TaskDecomposer.maybeAddExtract(plan, command);
-
-    if (plan) {
-      console.log(`[BrowserAgent] Rule-based plan: ${plan.summary} (${plan.steps.length} steps)`);
-      this.taskManager.addStep(task.id, `📋 ${plan.summary}`, 'completed', 'plan');
-    } else {
-      // ── Phase 2: LLM fallback for complex / unknown tasks ────────────
-      const planStep = this.taskManager.addStep(task.id, '🧠 Planning browser actions…', 'running', 'plan');
-      let currentUrl = 'about:blank';
-      try {
-        const view = this.tabManager.tabs.get(targetTabId);
-        currentUrl = view?.webContents?.getURL() || 'about:blank';
-      } catch {}
-
-      const planSchema = {
-        type: 'object',
-        properties: {
-          summary: { type: 'string' },
-          steps: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                type:   { type: 'string', enum: ['navigate', 'type', 'click', 'press_key', 'wait', 'visual_interact'] },
-                url:    { type: 'string' },
-                target: { type: 'string' },
-                text:   { type: 'string' },
-                key:    { type: 'string' },
-                ms:     { type: 'number' },
-                intent: { type: 'string' },
-              },
-              required: ['type'],
-            },
-          },
-        },
-        required: ['summary', 'steps'],
-      };
-
-      try {
-        const { data } = await this.modelGateway.structuredOutput(
-          `Current URL: ${currentUrl}\nTask: "${command}"\n\nOutput a browser action plan as JSON.`,
-          planSchema,
-          {
-            temperature: 0.1,
-            systemInstruction:
-              'Browser action planner. Step types: navigate(url), type(target,text), click(target), press_key(key), wait(ms), visual_interact(intent for MCQs/coding/captchas). ' +
-              'Always include wait(2000) after navigate. Keep steps minimal. Return ONLY valid JSON.',
-          }
-        );
-        if (data?.steps?.length) {
-          plan = data;
-          this.taskManager.updateStep(task.id, planStep.id, 'completed', plan.summary || `${plan.steps.length} step(s) planned`);
-        } else {
-          throw new Error('LLM returned empty plan');
-        }
-      } catch (llmErr) {
-        // Quota/fallback exhaustion — surface immediately; do NOT swallow into heuristic fallback.
-        if (BrowserAgent._isModelQuotaError(llmErr)) {
-          this.taskManager.updateStep(task.id, planStep.id, 'failed', llmErr.message);
-          this.taskManager.updateTaskStatus(task.id, 'failed', { error: llmErr.message });
-          if (assistantMsg?.id) {
-            await this.chatManager.updateMessage(assistantMsg.id, { content: `⚠️ ${llmErr.message}` });
-          }
-          throw llmErr;
-        }
-        // ── Phase 3: Last-resort heuristic fallback ────────────────────
-        console.warn('[BrowserAgent] LLM plan failed, trying heuristic fallback:', llmErr.message);
-        plan = TaskDecomposer.inferFallback(command);
-        if (plan) {
-          this.taskManager.updateStep(task.id, planStep.id, 'completed', `Fallback: ${plan.summary}`);
-        } else {
-          this.taskManager.updateStep(task.id, planStep.id, 'failed', llmErr.message);
-          throw new Error(`Could not plan the task: ${llmErr.message}`);
-        }
-      }
-    }
-
-    // ── Phase 4: Execute each step via DOM (with replan on verified_failed) ────
-    let currentSteps = plan.steps.map(s => this._normalizeStep(s));
-    let currentPlanSummary = plan.summary;
-    let stepIndex = 0;
-    let replanCount = 0;
-    let lastFailedStep = null;
-    const executionHistory = [];
-
-    while (stepIndex < currentSteps.length) {
-      if (this.taskManager.getTask(task.id)?.status === 'cancelled') break;
-      const step = currentSteps[stepIndex];
-
-      try {
-        const result = await this.executeStep(targetTabId, step, task);
-
-        // Record successful step in execution history
-        const stepAction = step.action || (step.type ? (step.type.startsWith('browser_') ? step.type : `browser_${step.type}`) : 'browser_action');
-        const targetStr = step.target || step.args?.targetDescription ? ` (${step.target || step.args?.targetDescription})` : '';
-        executionHistory.push({
-          action: `${stepAction}${targetStr}`,
-          result: typeof result === 'string' ? result.slice(0, 200) : 'completed',
-        });
-
-        // If this step matched the previously failed goal and succeeded, clear lastFailedStep
-        if (lastFailedStep && isSameStepGoal(step, lastFailedStep)) {
-          lastFailedStep = null;
-        }
-
-        // extract_and_report returns the final answer — post it and stop
-        if (step.type === 'extract_and_report' && result) {
-          this.taskManager.updateTaskStatus(task.id, 'completed', { outputs: result });
-          if (assistantMsg?.id) {
-            await this.chatManager.updateMessage(assistantMsg.id, { content: result });
-          }
-          this.auditLog.updateEntry(auditEntryId, { execution_status: 'success', execution_result: result });
-          return;
-        }
-
-        stepIndex++;
-      } catch (err) {
-        const isVerifiedFailed = err.message && err.message.startsWith('verified_failed:');
-        if (!isVerifiedFailed) {
-          // Unhandled non-verification error (tab closed, fatal network error) — abort immediately
-          throw err;
-        }
-
-        const reason = err.message.replace(/^verified_failed:\s*/, '').trim();
-
-        // 1. Only hard-abort if the SAME step goal fails verification twice in a row after a replan
-        if (lastFailedStep && isSameStepGoal(step, lastFailedStep)) {
-          console.warn(`[BrowserAgent] Same step goal "${step.target || step.description}" failed verification twice in a row after replan. Hard aborting.`);
-          const failMsg = `verified_failed: ${reason}`;
-          this.taskManager.updateTaskStatus(task.id, 'failed', { error: failMsg });
-          if (assistantMsg?.id) {
-            await this.chatManager.updateMessage(assistantMsg.id, { content: `❌ Task failed: ${reason}` });
-          }
-          this.auditLog?.updateEntry(auditEntryId, { execution_status: 'failed', error: failMsg });
-          throw new Error(failMsg);
-        }
-
-        // 2. Cap total replans per task at 3
-        if (replanCount >= 3) {
-          const maxErr = 'exceeded max recovery attempts';
-          console.warn(`[BrowserAgent] Replan limit reached (3). Failing task.`);
-          this.taskManager.updateTaskStatus(task.id, 'failed', { error: maxErr });
-          if (assistantMsg?.id) {
-            await this.chatManager.updateMessage(assistantMsg.id, { content: `❌ ${maxErr}` });
-          }
-          this.auditLog?.updateEntry(auditEntryId, { execution_status: 'failed', error: maxErr });
-          throw new Error(maxErr);
-        }
-
-        // 3. Mark step verified_failed (already marked in executeStep)
-        // Record lastFailedStep and increment replanCount
-        lastFailedStep = step;
-        replanCount++;
-
-        // 4. Capture current page state
-        const pageContext = await this._getPageContext(targetTabId);
-
-        // 5. Explicitly note "step X failed verification: <reason>" in executionHistory
-        const stepAction = step.action || (step.type ? (step.type.startsWith('browser_') ? step.type : `browser_${step.type}`) : 'browser_action');
-        const targetStr = step.target || step.args?.targetDescription ? ` (${step.target || step.args?.targetDescription})` : '';
-        const failMessage = `step ${stepIndex + 1} failed verification: ${reason}`;
-        executionHistory.push({
-          action: `${stepAction}${targetStr}`,
-          result: failMessage,
-        });
-
-        // 6. Give planner a chance to recover
-        if (!this.planner) {
-          const noPlannerErr = `verified_failed: ${reason} (no planner available to recover)`;
-          this.taskManager.updateTaskStatus(task.id, 'failed', { error: noPlannerErr });
-          throw new Error(noPlannerErr);
-        }
-
-        const replanStep = this.taskManager.addStep(
-          task.id,
-          `🔄 Replanning after verification failure (Attempt ${replanCount}/3)…`,
-          'running',
-          'plan'
-        );
-
-        let newPlan = null;
+      // ── Phase 0.7: Human-Like Web Task Agent (Shopping, Constraints, Cart, Media) ──────
+      if (this.webTaskAgent && isWebTaskCommand(command)) {
+        console.log(`[BrowserAgent] Routing to WebTaskAgent: "${command}"`);
+        const planStep = this.taskManager.addStep(task.id, '🎯 Parsing web task intent…', 'running', 'plan');
+        
+        let intent;
         try {
-          let chatHistory = [];
-          try {
-            if (this.chatManager?.getHistory) {
-              chatHistory = (await this.chatManager.getHistory()).slice(-5);
-            }
-          } catch (_) {}
-
-          const understanding = { intent: command, goal: command };
-          newPlan = await this.planner.createPlan(
-            understanding,
-            pageContext,
-            BROWSER_PLANNER_TOOLS,
-            chatHistory,
-            executionHistory
-          );
+          intent = await this.planner.parseWebTaskIntent(command);
           this.taskManager.updateStep(
             task.id,
-            replanStep.id,
+            planStep.id,
             'completed',
-            newPlan?.interpretation || `Revised plan with ${newPlan?.steps?.length || 0} step(s)`
+            `Target: ${intent.site.toUpperCase()} | Query: "${intent.search_query}" | Constraints: ${intent.constraints ? intent.constraints.length : 0}`
           );
-        } catch (planErr) {
-          if (BrowserAgent._isModelQuotaError(planErr)) {
-            this.taskManager.updateStep(task.id, replanStep.id, 'failed', planErr.message);
-            this.taskManager.updateTaskStatus(task.id, 'failed', { error: planErr.message });
-            if (assistantMsg?.id) {
-              await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${planErr.message}` });
+        } catch (intentErr) {
+          console.warn('[BrowserAgent] Intent parsing failed:', intentErr.message);
+          if (BrowserAgent._isModelQuotaError(intentErr)) {
+            this.taskManager.updateStep(task.id, planStep.id, 'failed', intentErr.message);
+            throw intentErr;
+          }
+          intent = PlannerEngine._parseWebTaskIntentFallback(command);
+          this.taskManager.updateStep(
+            task.id,
+            planStep.id,
+            'completed',
+            `Target: ${intent.site.toUpperCase()} | Query: "${intent.search_query}" (fallback)`
+          );
+        }
+
+        const result = await this.webTaskAgent.execute({
+          intent,
+          command,
+          tabId: targetTabId,
+          task,
+          assistantMsg,
+          auditEntryId,
+        });
+
+        return result;
+      }
+
+      let plan = TaskDecomposer.decompose(command);
+      // Append extract_and_report step if user wants info summarized to chat
+      if (plan) plan = TaskDecomposer.maybeAddExtract(plan, command);
+
+      if (plan) {
+        console.log(`[BrowserAgent] Rule-based plan: ${plan.summary} (${plan.steps.length} steps)`);
+        this.taskManager.addStep(task.id, `📋 ${plan.summary}`, 'completed', 'plan');
+      } else {
+        // ── Phase 2: LLM fallback for complex / unknown tasks ────────────
+        const planStep = this.taskManager.addStep(task.id, '🧠 Planning browser actions…', 'running', 'plan');
+        let currentUrl = 'about:blank';
+        try {
+          const view = this.tabManager.tabs.get(targetTabId);
+          currentUrl = view?.webContents?.getURL() || 'about:blank';
+        } catch {}
+
+        const planSchema = {
+          type: 'object',
+          properties: {
+            summary: { type: 'string' },
+            steps: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  type:   { type: 'string', enum: ['navigate', 'type', 'click', 'press_key', 'wait', 'visual_interact'] },
+                  url:    { type: 'string' },
+                  target: { type: 'string' },
+                  text:   { type: 'string' },
+                  key:    { type: 'string' },
+                  ms:     { type: 'number' },
+                  intent: { type: 'string' },
+                },
+                required: ['type'],
+              },
+            },
+          },
+          required: ['summary', 'steps'],
+        };
+
+        try {
+          const { data } = await this.modelGateway.structuredOutput(
+            `Current URL: ${currentUrl}\nTask: "${command}"\n\nOutput a browser action plan as JSON.`,
+            planSchema,
+            {
+              temperature: 0.1,
+              systemInstruction:
+                'Browser action planner. Step types: navigate(url), type(target,text), click(target), press_key(key), wait(ms), visual_interact(intent for MCQs/coding/captchas). ' +
+                'Always include wait(2000) after navigate. Keep steps minimal. Return ONLY valid JSON.',
             }
+          );
+          if (data?.steps?.length) {
+            plan = data;
+            this.taskManager.updateStep(task.id, planStep.id, 'completed', plan.summary || `${plan.steps.length} step(s) planned`);
+          } else {
+            throw new Error('LLM returned empty plan');
+          }
+        } catch (llmErr) {
+          // Quota/fallback exhaustion — surface immediately; do NOT swallow into heuristic fallback.
+          if (BrowserAgent._isModelQuotaError(llmErr)) {
+            this.taskManager.updateStep(task.id, planStep.id, 'failed', llmErr.message);
+            this.taskManager.updateTaskStatus(task.id, 'failed', { error: llmErr.message });
+            if (assistantMsg?.id) {
+              await this.chatManager.updateMessage(assistantMsg.id, { content: `⚠️ ${llmErr.message}`, isLoading: false, streaming: false });
+            }
+            throw llmErr;
+          }
+          // ── Phase 3: Last-resort heuristic fallback ────────────────────
+          console.warn('[BrowserAgent] LLM plan failed, trying heuristic fallback:', llmErr.message);
+          plan = TaskDecomposer.inferFallback(command);
+          if (plan) {
+            this.taskManager.updateStep(task.id, planStep.id, 'completed', `Fallback: ${plan.summary}`);
+          } else {
+            this.taskManager.updateStep(task.id, planStep.id, 'failed', llmErr.message);
+            throw new Error(`Could not plan the task: ${llmErr.message}`);
+          }
+        }
+      }
+
+      // ── Phase 4: Execute each step via DOM (with replan on verified_failed) ────
+      let currentSteps = plan.steps.map(s => this._normalizeStep(s));
+      let currentPlanSummary = plan.summary;
+      let stepIndex = 0;
+      let replanCount = 0;
+      let lastFailedStep = null;
+      const executionHistory = [];
+
+      while (stepIndex < currentSteps.length) {
+        if (this.taskManager.getTask(task.id)?.status === 'cancelled') break;
+        const step = currentSteps[stepIndex];
+
+        try {
+          const result = await this.executeStep(targetTabId, step, task);
+          if (this.taskManager.getTask(task.id)?.status === 'cancelled') break;
+
+          // Record successful step in execution history
+          const stepAction = step.action || (step.type ? (step.type.startsWith('browser_') ? step.type : `browser_${step.type}`) : 'browser_action');
+          const targetStr = step.target || step.args?.targetDescription ? ` (${step.target || step.args?.targetDescription})` : '';
+          executionHistory.push({
+            action: `${stepAction}${targetStr}`,
+            result: typeof result === 'string' ? result.slice(0, 200) : 'completed',
+          });
+
+          // If this step matched the previously failed goal and succeeded, clear lastFailedStep
+          if (lastFailedStep && isSameStepGoal(step, lastFailedStep)) {
+            lastFailedStep = null;
+          }
+
+          // extract_and_report returns the final answer — post it and stop
+          if (step.type === 'extract_and_report' && result) {
+            this.taskManager.updateTaskStatus(task.id, 'completed', { outputs: result });
+            if (assistantMsg?.id) {
+              await this.chatManager.updateMessage(assistantMsg.id, { content: result, isLoading: false, streaming: false });
+            }
+            this.auditLog.updateEntry(auditEntryId, { execution_status: 'success', execution_result: result });
+            return;
+          }
+
+          stepIndex++;
+        } catch (err) {
+          const isVerifiedFailed = err.message && err.message.startsWith('verified_failed:');
+          if (!isVerifiedFailed) {
+            // Unhandled non-verification error (tab closed, fatal network error) — abort immediately
+            throw err;
+          }
+
+          const reason = err.message.replace(/^verified_failed:\s*/, '').trim();
+
+          // 1. Only hard-abort if the SAME step goal fails verification twice in a row after a replan
+          if (lastFailedStep && isSameStepGoal(step, lastFailedStep)) {
+            console.warn(`[BrowserAgent] Same step goal "${step.target || step.description}" failed verification twice in a row after replan. Hard aborting.`);
+            const failMsg = `verified_failed: ${reason}`;
+            this.taskManager.updateTaskStatus(task.id, 'failed', { error: failMsg });
+            if (assistantMsg?.id) {
+              await this.chatManager.updateMessage(assistantMsg.id, { content: `❌ Task failed: ${reason}`, isLoading: false, streaming: false });
+            }
+            this.auditLog?.updateEntry(auditEntryId, { execution_status: 'failed', error: failMsg });
+            throw new Error(failMsg);
+          }
+
+          // 2. Cap total replans per task at 3
+          if (replanCount >= 3) {
+            const maxErr = 'exceeded max recovery attempts';
+            console.warn(`[BrowserAgent] Replan limit reached (3). Failing task.`);
+            this.taskManager.updateTaskStatus(task.id, 'failed', { error: maxErr });
+            if (assistantMsg?.id) {
+              await this.chatManager.updateMessage(assistantMsg.id, { content: `❌ ${maxErr}`, isLoading: false, streaming: false });
+            }
+            this.auditLog?.updateEntry(auditEntryId, { execution_status: 'failed', error: maxErr });
+            throw new Error(maxErr);
+          }
+
+          // 3. Mark step verified_failed (already marked in executeStep)
+          // Record lastFailedStep and increment replanCount
+          lastFailedStep = step;
+          replanCount++;
+
+          // 4. Capture current page state
+          const pageContext = await this._getPageContext(targetTabId);
+
+          // 5. Explicitly note "step X failed verification: <reason>" in executionHistory
+          const stepAction = step.action || (step.type ? (step.type.startsWith('browser_') ? step.type : `browser_${step.type}`) : 'browser_action');
+          const targetStr = step.target || step.args?.targetDescription ? ` (${step.target || step.args?.targetDescription})` : '';
+          const failMessage = `step ${stepIndex + 1} failed verification: ${reason}`;
+          executionHistory.push({
+            action: `${stepAction}${targetStr}`,
+            result: failMessage,
+          });
+
+          // 6. Give planner a chance to recover
+          if (!this.planner) {
+            const noPlannerErr = `verified_failed: ${reason} (no planner available to recover)`;
+            this.taskManager.updateTaskStatus(task.id, 'failed', { error: noPlannerErr });
+            throw new Error(noPlannerErr);
+          }
+
+          const replanStep = this.taskManager.addStep(
+            task.id,
+            `🔄 Replanning after verification failure (Attempt ${replanCount}/3)…`,
+            'running',
+            'plan'
+          );
+
+          let newPlan = null;
+          try {
+            let chatHistory = [];
+            try {
+              if (this.chatManager?.getHistory) {
+                chatHistory = (await this.chatManager.getHistory()).slice(-5);
+              }
+            } catch (_) {}
+
+            const understanding = { intent: command, goal: command };
+            newPlan = await this.planner.createPlan(
+              understanding,
+              pageContext,
+              BROWSER_PLANNER_TOOLS,
+              chatHistory,
+              executionHistory
+            );
+            this.taskManager.updateStep(
+              task.id,
+              replanStep.id,
+              'completed',
+              newPlan?.interpretation || `Revised plan with ${newPlan?.steps?.length || 0} step(s)`
+            );
+          } catch (planErr) {
+            if (BrowserAgent._isModelQuotaError(planErr)) {
+              this.taskManager.updateStep(task.id, replanStep.id, 'failed', planErr.message);
+              this.taskManager.updateTaskStatus(task.id, 'failed', { error: planErr.message });
+              if (assistantMsg?.id) {
+                await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${planErr.message}`, isLoading: false, streaming: false });
+              }
+              throw planErr;
+            }
+            this.taskManager.updateStep(task.id, replanStep.id, 'failed', planErr.message);
+            this.taskManager.updateTaskStatus(task.id, 'failed', { error: `Replanning failed: ${planErr.message}` });
             throw planErr;
           }
-          this.taskManager.updateStep(task.id, replanStep.id, 'failed', planErr.message);
-          this.taskManager.updateTaskStatus(task.id, 'failed', { error: `Replanning failed: ${planErr.message}` });
-          throw planErr;
-        }
 
-        if (!newPlan?.steps?.length) {
-          const emptyErr = `verified_failed: planner could not generate revised plan after step failed: ${reason}`;
-          this.taskManager.updateTaskStatus(task.id, 'failed', { error: emptyErr });
-          throw new Error(emptyErr);
-        }
+          if (!newPlan?.steps?.length) {
+            const emptyErr = `verified_failed: planner could not generate revised plan after step failed: ${reason}`;
+            this.taskManager.updateTaskStatus(task.id, 'failed', { error: emptyErr });
+            throw new Error(emptyErr);
+          }
 
-        // Replace remaining steps with the revised plan from actual current state
-        currentSteps = newPlan.steps.map(s => {
-          const norm = this._normalizeStep(s);
-          // Prefer vision on replan after verification failure to avoid repeating DOM traps
-          norm.preferVision = true;
-          return norm;
-        });
-        currentPlanSummary = newPlan.interpretation || currentPlanSummary;
-        stepIndex = 0;
+          // Replace remaining steps with the revised plan from actual current state
+          currentSteps = newPlan.steps.map(s => {
+            const norm = this._normalizeStep(s);
+            // Prefer vision on replan after verification failure to avoid repeating DOM traps
+            norm.preferVision = true;
+            return norm;
+          });
+          currentPlanSummary = newPlan.interpretation || currentPlanSummary;
+          stepIndex = 0;
+        }
+      }
+
+      if (this.taskManager.getTask(task.id)?.status === 'cancelled') {
+        return;
+      }
+
+      await this.finish(task.id, assistantMsg?.id, auditEntryId, currentPlanSummary || plan.summary || 'Task completed.');
+    } catch (err) {
+      executionError = err;
+      throw err;
+    } finally {
+      // 1. Ensure task is in a terminal status
+      const currentTask = this.taskManager.getTask(task?.id);
+      const isTerminal = currentTask && ['completed', 'failed', 'cancelled', 'rejected'].includes(currentTask.status);
+      if (!isTerminal && task?.id) {
+        if (executionError) {
+          this.taskManager.updateTaskStatus(task.id, 'failed', { error: executionError.message });
+        } else {
+          const status = currentTask?.status === 'cancelled' ? 'cancelled' : 'completed';
+          this.taskManager.updateTaskStatus(task.id, status);
+        }
+      }
+
+      // 2. Ensure assistant message has isLoading: false, streaming: false with final text
+      if (assistantMsg?.id) {
+        try {
+          const session = await this.chatManager.getActiveSession();
+          const msg = session?.messages?.find(m => m.id === assistantMsg.id);
+          if (msg && (msg.isLoading || msg.streaming || !msg.content)) {
+            const finalTask = this.taskManager.getTask(task?.id);
+            let finalContent = msg.content;
+            if (!finalContent) {
+              if (finalTask?.status === 'cancelled') {
+                finalContent = 'Task was cancelled.';
+              } else if (finalTask?.status === 'failed') {
+                finalContent = finalTask.error ? `❌ Task failed: ${finalTask.error}` : '❌ Task failed.';
+              } else if (executionError) {
+                finalContent = `❌ Task failed: ${executionError.message}`;
+              } else {
+                finalContent = typeof finalTask?.outputs === 'string' ? finalTask.outputs : '✅ Task completed.';
+              }
+            }
+            await this.chatManager.updateMessage(assistantMsg.id, {
+              content: finalContent,
+              isLoading: false,
+              streaming: false,
+            });
+          }
+        } catch (chatErr) {
+          console.warn('[BrowserAgent] Failed to update chat message in finally:', chatErr.message);
+        }
       }
     }
-
-    await this.finish(task.id, assistantMsg?.id, auditEntryId, currentPlanSummary || plan.summary || 'Task completed.');
   }
 
   // ── Step executor: DOM-first, vision fallback for visual_interact ─────
@@ -894,18 +1059,35 @@ class BrowserAgent {
     const STEP_TIMEOUT_MS = (step.preferVision || step.type === 'visual_interact') ? 35000 : 20000;
     let subStage = 'init'; // tracks which sub-stage was in flight when timeout fires
     let stepTimeoutHandle;
+    let isAborted = false;
+    const checkAborted = () => {
+      if (isAborted) {
+        const err = new Error(`Step aborted due to timeout (${STEP_TIMEOUT_MS}ms, sub-stage: ${subStage})`);
+        err.isAborted = true;
+        throw err;
+      }
+    };
+    const updateSubStage = (s) => {
+      checkAborted();
+      subStage = s;
+    };
     const stepTimeoutPromise = new Promise((_res, rej) => {
       stepTimeoutHandle = setTimeout(() => {
+        isAborted = true;
         console.error(`[BrowserAgent] Step timeout (${STEP_TIMEOUT_MS}ms) fired during sub-stage="${subStage}" for step type="${step.type}" target="${step.target || step.url || '?'}".`);
         rej(new Error(`verified_failed: step timed out after ${STEP_TIMEOUT_MS}ms (sub-stage: ${subStage})`));
       }, STEP_TIMEOUT_MS);
     });
 
     try {
-      const result = await Promise.race([stepTimeoutPromise, this._executeStepBody(tabId, step, task, view, stepEntry, () => subStage, (s) => { subStage = s; })]);
+      const result = await Promise.race([
+        stepTimeoutPromise,
+        this._executeStepBody(tabId, step, task, view, stepEntry, () => subStage, updateSubStage, checkAborted)
+      ]);
       clearTimeout(stepTimeoutHandle);
       return result;
     } catch (err) {
+      isAborted = true;
       clearTimeout(stepTimeoutHandle);
       // Mark the step if not already marked
       if (err.message?.startsWith('verified_failed:')) {
@@ -926,10 +1108,12 @@ class BrowserAgent {
 
   // ── Poll for URL change (SPA pushState + full navigations) ───────────────────
   // Resolves true when the URL differs from beforeUrl within timeoutMs.
-  async _pollUrlChanged(tabId, beforeUrl, timeoutMs = 5000) {
+  async _pollUrlChanged(tabId, beforeUrl, timeoutMs = 5000, checkAborted = null) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      if (checkAborted) checkAborted();
       await new Promise(r => setTimeout(r, 250));
+      if (checkAborted) checkAborted();
       try {
         const view = this.tabManager.tabs.get(tabId);
         if (!view) return false;
@@ -941,11 +1125,13 @@ class BrowserAgent {
   }
 
   // ── Internal step body (separated so it can race against the timeout) ────────
-  async _executeStepBody(tabId, step, task, view, stepEntry, getSubStage, setSubStage) {
+  async _executeStepBody(tabId, step, task, view, stepEntry, getSubStage, setSubStage, checkAborted) {
     try {
+      if (checkAborted) checkAborted();
+
       switch (step.type) {
         case 'navigate': {
-
+          setSubStage('navigate-load');
           let url = (step.url || '').trim();
           if (url && !url.startsWith('http')) url = 'https://' + url;
           if (!url) throw new Error('navigate step is missing a url');
@@ -959,10 +1145,30 @@ class BrowserAgent {
             }
           }
 
+          setSubStage('navigate-settle');
           // Wait up to 10s for page to settle after redirects
-          await new Promise(resolve => {
+          await new Promise((resolve, reject) => {
             let done = false;
-            const finish = () => { if (!done) { done = true; resolve(); } };
+            let pollTimer = setInterval(() => {
+              if (checkAborted) {
+                try {
+                  checkAborted();
+                } catch (e) {
+                  if (!done) {
+                    done = true;
+                    clearInterval(pollTimer);
+                    reject(e);
+                  }
+                }
+              }
+            }, 250);
+            const finish = () => {
+              if (!done) {
+                done = true;
+                clearInterval(pollTimer);
+                resolve();
+              }
+            };
             if (!view.webContents.isLoading()) {
               finish();
             } else {
@@ -971,8 +1177,10 @@ class BrowserAgent {
             }
           });
 
+          setSubStage('navigate-hydration');
           // Buffer for SPA hydration
           await new Promise(r => setTimeout(r, 800));
+          if (checkAborted) checkAborted();
 
           // Invalidate grounding cache when domain changes after navigation
           if (this.groundingRouter) {
@@ -986,10 +1194,12 @@ class BrowserAgent {
         }
 
         case 'type': {
+          setSubStage('type-grounding');
           // Use GroundingRouter when available (DOM → LLM → Vision pipeline)
           if (this.groundingRouter) {
             let grounded = null;
             for (let attempt = 0; attempt < 3; attempt++) {
+              if (checkAborted) checkAborted();
               const pageCtx = { url: view.webContents.getURL() };
               grounded = await this.groundingRouter.resolveElement(
                 tabId,
@@ -1000,13 +1210,16 @@ class BrowserAgent {
               );
               if (grounded.strategy !== 'failed') break;
               await new Promise(r => setTimeout(r, 800));
+              if (checkAborted) checkAborted();
             }
 
+            setSubStage('type-snapshot');
             // ── Snapshot before action ─────────────────────────────────────
             const typeBeforeSnap = (grounded && grounded.elementId)
               ? await this._snapshotElement(tabId, grounded.elementId)
               : null;
 
+            setSubStage('type-dispatch');
             if (grounded && grounded.elementId) {
               await this.browserInteractionEngine.typeText(tabId, grounded.elementId, step.text || '');
             } else if (grounded && grounded.coords) {
@@ -1017,23 +1230,32 @@ class BrowserAgent {
               await new Promise(r => setTimeout(r, 300));
             }
 
+            setSubStage('type-post-condition-verify');
             // ── Post-condition: verify DOM state changed ───────────────────
             if (grounded && grounded.elementId) {
-              const typeChanged = await this._pollElementChanged(tabId, grounded.elementId, typeBeforeSnap, 3000);
+              const typeChanged = await this._pollElementChanged(tabId, grounded.elementId, typeBeforeSnap, 3000, checkAborted);
+              if (checkAborted) checkAborted();
               if (!typeChanged) {
+                setSubStage('type-retry-grounding');
                 const pageUrl2  = view.webContents.getURL();
                 const domain2   = this._domainOf(pageUrl2);
                 this.groundingRouter.invalidateCacheKey(domain2, step.target || '', 'type');
                 const nextStrat = this.groundingRouter.getNextStrategy(grounded.strategy);
                 let retryOk = false;
                 if (nextStrat) {
+                  if (checkAborted) checkAborted();
                   const retried = await this.groundingRouter._runStrategy(nextStrat, tabId, step.target || '', 'type');
+                  if (checkAborted) checkAborted();
                   if (retried && retried.elementId) {
+                    setSubStage('type-retry-dispatch');
                     const retryBefore = await this._snapshotElement(tabId, retried.elementId);
+                    if (checkAborted) checkAborted();
                     await this.browserInteractionEngine.typeText(tabId, retried.elementId, step.text || '');
-                    retryOk = await this._pollElementChanged(tabId, retried.elementId, retryBefore, 3000);
+                    setSubStage('type-retry-verify');
+                    retryOk = await this._pollElementChanged(tabId, retried.elementId, retryBefore, 3000, checkAborted);
                   }
                 }
+                if (checkAborted) checkAborted();
                 if (!retryOk) {
                   this.taskManager.updateStep(task.id, stepEntry.id, 'verified_failed',
                     'Typed but input value did not change (no state change detected)');
@@ -1045,13 +1267,16 @@ class BrowserAgent {
             // Legacy path (no router injected)
             let elementId = null;
             for (let attempt = 0; attempt < 5; attempt++) {
+              if (checkAborted) checkAborted();
               const res = await this.browserInteractionEngine.resolveElementLocally(
                 tabId, step.target || '', 'browser_type'
               );
               elementId = res.elementId;
               if (elementId) break;
               await new Promise(r => setTimeout(r, 800));
+              if (checkAborted) checkAborted();
             }
+            if (checkAborted) checkAborted();
             if (elementId) {
               await this.browserInteractionEngine.typeText(tabId, elementId, step.text || '');
             } else {
@@ -1068,6 +1293,7 @@ class BrowserAgent {
             let grounded = null;
             setSubStage('grounding');
             for (let attempt = 0; attempt < 3; attempt++) {
+              if (checkAborted) checkAborted();
               const pageCtx = { url: view.webContents.getURL() };
               grounded = await this.groundingRouter.resolveElement(
                 tabId,
@@ -1078,7 +1304,9 @@ class BrowserAgent {
               );
               if (grounded.strategy !== 'failed') break;
               await new Promise(r => setTimeout(r, 800));
+              if (checkAborted) checkAborted();
             }
+            if (checkAborted) checkAborted();
             if (!grounded || grounded.strategy === 'failed') {
               throw new Error(`Cannot find element: "${step.target}"`);
             }
@@ -1102,9 +1330,9 @@ class BrowserAgent {
             const isNavClick = this._detectsNavigation(step);
             if (grounded.elementId) {
               // Run DOM poll (and optionally URL poll) concurrently
-              const domPoll = this._pollElementChanged(tabId, grounded.elementId, clickBeforeSnap, 3000);
+              const domPoll = this._pollElementChanged(tabId, grounded.elementId, clickBeforeSnap, 3000, checkAborted);
               const urlPoll = isNavClick
-                ? this._pollUrlChanged(tabId, clickBeforeUrl, 4000)
+                ? this._pollUrlChanged(tabId, clickBeforeUrl, 4000, checkAborted)
                 : Promise.resolve(false);
 
               const clickChanged = await Promise.race([
@@ -1117,6 +1345,7 @@ class BrowserAgent {
                 return Promise.race([domPoll, urlPoll]);
               });
 
+              if (checkAborted) checkAborted();
               if (!clickChanged) {
                 setSubStage('retry-grounding');
                 const pageUrl2  = view.webContents.getURL();
@@ -1125,15 +1354,18 @@ class BrowserAgent {
                 const nextStrat = this.groundingRouter.getNextStrategy(grounded.strategy);
                 let retryOk = false;
                 if (nextStrat) {
+                  if (checkAborted) checkAborted();
                   const retried = await this.groundingRouter._runStrategy(nextStrat, tabId, step.target || '', 'click');
+                  if (checkAborted) checkAborted();
                   if (retried && retried.elementId) {
                     setSubStage('retry-click-dispatch');
                     const retryBefore    = await this._snapshotElement(tabId, retried.elementId);
                     const retryBeforeUrl = view.webContents.getURL();
+                    if (checkAborted) checkAborted();
                     await this.browserInteractionEngine.clickElement(tabId, retried.elementId);
                     setSubStage('retry-post-condition-verify');
-                    const domOk = this._pollElementChanged(tabId, retried.elementId, retryBefore, 3000);
-                    const urlOk = isNavClick ? this._pollUrlChanged(tabId, retryBeforeUrl, 4000) : Promise.resolve(false);
+                    const domOk = this._pollElementChanged(tabId, retried.elementId, retryBefore, 3000, checkAborted);
+                    const urlOk = isNavClick ? this._pollUrlChanged(tabId, retryBeforeUrl, 4000, checkAborted) : Promise.resolve(false);
                     retryOk = await Promise.race([
                       domOk.then(v => v || false),
                       urlOk.then(v => v || false),
@@ -1141,10 +1373,12 @@ class BrowserAgent {
                     if (!retryOk) retryOk = await Promise.race([domOk, urlOk]);
                   } else if (retried && retried.coords) {
                     setSubStage('retry-click-dispatch');
+                    if (checkAborted) checkAborted();
                     await this.browserInteractionEngine.clickAt(tabId, retried.coords.x, retried.coords.y);
                     retryOk = true; // vision coords — no element to snapshot; assume registered
                   }
                 }
+                if (checkAborted) checkAborted();
                 if (!retryOk) {
                   this.taskManager.updateStep(task.id, stepEntry.id, 'verified_failed',
                     'Clicked but page state did not change (no DOM/URL/ARIA change detected)');
@@ -1157,35 +1391,48 @@ class BrowserAgent {
             let elementId = null;
             setSubStage('legacy-grounding');
             for (let attempt = 0; attempt < 5; attempt++) {
+              if (checkAborted) checkAborted();
               const res = await this.browserInteractionEngine.resolveElementLocally(
                 tabId, step.target || '', 'browser_click'
               );
               elementId = res.elementId;
               if (elementId) break;
               await new Promise(r => setTimeout(r, 800));
+              if (checkAborted) checkAborted();
             }
+            if (checkAborted) checkAborted();
             if (!elementId) throw new Error(`Cannot find element: "${step.target}"`);
             setSubStage('legacy-click-dispatch');
+            if (checkAborted) checkAborted();
             await this.browserInteractionEngine.clickElement(tabId, elementId);
           }
           break;
         }
 
         case 'press_key':
+          if (checkAborted) checkAborted();
           await this.browserInteractionEngine.pressKey(tabId, step.key || 'Enter');
           break;
 
         case 'scroll': {
+          if (checkAborted) checkAborted();
           const amt = Number.isFinite(step.amount) ? step.amount : 500;
           await this.browserInteractionEngine.scrollPage(tabId, amt);
           break;
         }
 
-        case 'wait':
-          await new Promise(r => setTimeout(r, Math.min(step.ms || 1000, 12000)));
+        case 'wait': {
+          const waitTotal = Math.min(step.ms || 1000, 12000);
+          const waitStart = Date.now();
+          while (Date.now() - waitStart < waitTotal) {
+            if (checkAborted) checkAborted();
+            await new Promise(r => setTimeout(r, Math.min(250, waitTotal - (Date.now() - waitStart))));
+          }
           break;
+        }
 
         case 'visual_interact': {
+          if (checkAborted) checkAborted();
           // Route through GroundingRouter when available (enforces single-backend rule)
           if (this.groundingRouter) {
             const intent = step.intent || step.text || step.target || 'Perform the requested action';
@@ -1199,6 +1446,7 @@ class BrowserAgent {
               viActionType,
               { preferVision: step.preferVision !== undefined ? Boolean(step.preferVision) : true }
             );
+            if (checkAborted) checkAborted();
             if (grounded.elementId) {
               await this.browserInteractionEngine.clickElement(tabId, grounded.elementId);
             } else if (grounded.coords) {
@@ -1216,11 +1464,13 @@ class BrowserAgent {
             const lm = this.getLocalModelManager();
             if (vs && lm?.getStatus().ready) {
               const screenshot = await this.tabManager.captureScreenshot(tabId);
+              if (checkAborted) checkAborted();
               if (screenshot) {
                 const action = await vs.infer(
                   screenshot,
                   step.intent || step.text || 'Perform the requested action'
                 );
+                if (checkAborted) checkAborted();
                 if (action?.action === 'click' && Number.isFinite(action.x)) {
                   await this.browserInteractionEngine.clickAt(tabId, action.x, action.y);
                 } else if (action?.action === 'type' && Number.isFinite(action.x)) {
@@ -1233,6 +1483,7 @@ class BrowserAgent {
                 const { elementId } = await this.browserInteractionEngine.resolveElementLocally(
                   tabId, step.target, 'browser_click'
                 );
+                if (checkAborted) checkAborted();
                 if (elementId) await this.browserInteractionEngine.clickElement(tabId, elementId);
               }
             }
@@ -1241,7 +1492,7 @@ class BrowserAgent {
         }
 
         case 'extract_and_report': {
-          // Extract the visible page text and summarize it back to the user in chat
+          if (checkAborted) checkAborted();
           this.taskManager.updateStep(task.id, stepEntry.id, 'running', '📖 Reading page content…');
           let rawText = '';
           try {
@@ -1261,8 +1512,8 @@ class BrowserAgent {
                   .forEach(sel => cloned.querySelectorAll(sel).forEach(el => el.remove()));
                 // Get text, collapse whitespace, cap at 12000 chars
                 return (cloned.innerText || cloned.textContent || '')
-                  .replace(/[ \t]+/g, ' ')
-                  .replace(/\n{3,}/g, '\n\n')
+                  .replace(/[ \\t]+/g, ' ')
+                  .replace(/\\n{3,}/g, '\\n\\n')
                   .trim()
                   .slice(0, 12000);
               })()
@@ -1271,16 +1522,13 @@ class BrowserAgent {
             console.error('[BrowserAgent] extract_and_report JS failed:', jsErr.message);
           }
 
+          if (checkAborted) checkAborted();
           if (!rawText || rawText.length < 50) {
             this.taskManager.updateStep(task.id, stepEntry.id, 'failed', 'Could not extract page text');
             return null;
           }
 
           // ── Wrong-page guard: compare <h1>/title against intended topic ────────────
-          // Extracts the canonical h1 or page title from the DOM and runs a
-          // token-overlap check against the topic parsed from step.intent.
-          // If similarity < 0.25, we've likely landed on a disambiguation or
-          // unrelated page — discard extracted content and signal re-search.
           if (step.intent) {
             let pageH1 = '';
             try {
@@ -1300,6 +1548,7 @@ class BrowserAgent {
             }
           }
 
+          if (checkAborted) checkAborted();
           const currentPageUrl = view.webContents.getURL();
           const summaryStep = this.taskManager.addStep(task.id, '✍️ Summarizing content…', 'running', 'execute');
           let summary = '';
@@ -1319,8 +1568,10 @@ class BrowserAgent {
               }
             );
             summary = text;
+            if (checkAborted) checkAborted();
             this.taskManager.updateStep(task.id, summaryStep.id, 'completed', 'Summary ready');
           } catch (llmErr) {
+            if (checkAborted) checkAborted();
             this.taskManager.updateStep(task.id, summaryStep.id, 'failed', llmErr.message);
             // Quota errors — surface immediately; do NOT silently fallback to raw text.
             if (BrowserAgent._isModelQuotaError(llmErr)) {
@@ -1331,6 +1582,7 @@ class BrowserAgent {
             summary = `**Content from ${currentPageUrl}**\n\n${rawText.slice(0, 800)}\n\n_[Could not summarize — showing raw extract]_`;
           }
 
+          if (checkAborted) checkAborted();
           this.taskManager.updateStep(task.id, stepEntry.id, 'completed', 'Content extracted');
           return summary;
         }
@@ -1344,7 +1596,9 @@ class BrowserAgent {
       // Defaults to null (skip check) for steps that don't set it — backward-compatible.
       const eps = step.expectedPostState || null;
       if (eps && ['type', 'click', 'visual_interact'].includes(step.type)) {
+        if (checkAborted) checkAborted();
         const postOk = await this._checkExpectedPostState(tabId, eps, view);
+        if (checkAborted) checkAborted();
         if (!postOk) {
           this.taskManager.updateStep(task.id, stepEntry.id, 'verified_failed',
             `Post-condition not met: "${eps}"`);
@@ -1352,8 +1606,13 @@ class BrowserAgent {
         }
       }
 
+      if (checkAborted) checkAborted();
       this.taskManager.updateStep(task.id, stepEntry.id, 'completed', 'Done');
     } catch (err) {
+      if (err.isAborted || err.message?.includes('aborted due to timeout')) {
+        // Step was aborted: suppress stale updates
+        throw err;
+      }
       // 'verified_failed' steps already have their step status set — don't overwrite with 'failed'
       if (!err.message || !err.message.startsWith('verified_failed:')) {
         this.taskManager.updateStep(task.id, stepEntry.id, 'failed', err.message);
@@ -1398,13 +1657,14 @@ class BrowserAgent {
    * from `before`. Returns true when a change is detected or the element
    * disappears; false if the timeout elapses with no change.
    */
-  async _pollElementChanged(tabId, elementId, before, timeoutMs) {
+  async _pollElementChanged(tabId, elementId, before, timeoutMs, checkAborted = null) {
     if (!before) return true; // no baseline — treat as changed
     const view = this.tabManager.tabs.get(tabId);
     if (!view) return true;
     const start = Date.now();
     const beforeSerial = JSON.stringify(before);
     while (Date.now() - start < timeoutMs) {
+      if (checkAborted) checkAborted();
       try {
         const after = await view.webContents.executeJavaScript(
           '(() => { const el = document.querySelector(\'[data-actra-id="' + elementId + '"]\');' +
@@ -1426,7 +1686,9 @@ class BrowserAgent {
       } catch (_) {
         return true; // script error → page navigated
       }
+      if (checkAborted) checkAborted();
       await new Promise(r => setTimeout(r, 300));
+      if (checkAborted) checkAborted();
     }
     return false;
   }
@@ -1531,7 +1793,11 @@ class BrowserAgent {
   async finish(taskId, assistantMsgId, auditEntryId, answer) {
     this.taskManager.updateTaskStatus(taskId, 'completed', { outputs: answer || 'Task completed.' });
     if (assistantMsgId) {
-      await this.chatManager.updateMessage(assistantMsgId, { content: '✅ ' + (answer || 'Task completed successfully.') });
+      await this.chatManager.updateMessage(assistantMsgId, {
+        content: '✅ ' + (answer || 'Task completed successfully.'),
+        isLoading: false,
+        streaming: false,
+      });
     }
     this.auditLog.updateEntry(auditEntryId, { execution_status: 'success', execution_result: answer });
   }
@@ -1708,13 +1974,13 @@ class BrowserAgent {
           console.error(`[MCQ] Quota exhausted before question ${solved + 1}: ${quotaMsg}`);
           this.taskManager.updateTaskStatus(task.id, 'failed', { error: quotaMsg });
           if (assistantMsg?.id) {
-            await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${quotaMsg}` });
+            await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${quotaMsg}`, isLoading: false, streaming: false });
           }
           throw availErr;
         }
         this.taskManager.updateTaskStatus(task.id, 'failed', { error: availErr.message });
         if (assistantMsg?.id) {
-          await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${availErr.message}` });
+          await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${availErr.message}`, isLoading: false, streaming: false });
         }
         throw availErr;
       }
@@ -1889,7 +2155,7 @@ Return JSON:
                   this.taskManager.updateStep(task.id, qStep.id, 'failed', reasonErr.message);
                   this.taskManager.updateTaskStatus(task.id, 'failed', { error: reasonErr.message });
                   if (assistantMsg?.id) {
-                    await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${reasonErr.message}` });
+                    await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${reasonErr.message}`, isLoading: false, streaming: false });
                   }
                   throw reasonErr;
                 }
@@ -1913,7 +2179,7 @@ Return JSON:
                     this.taskManager.updateStep(task.id, qStep.id, 'failed', chatErr.message);
                     this.taskManager.updateTaskStatus(task.id, 'failed', { error: chatErr.message });
                     if (assistantMsg?.id) {
-                      await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${chatErr.message}` });
+                      await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${chatErr.message}`, isLoading: false, streaming: false });
                     }
                     throw chatErr;
                   }
@@ -1957,7 +2223,7 @@ Return JSON:
               this.taskManager.updateStep(task.id, qStep.id, 'failed', vErr.message);
               this.taskManager.updateTaskStatus(task.id, 'failed', { error: vErr.message });
               if (assistantMsg?.id) {
-                await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${vErr.message}` });
+                await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${vErr.message}`, isLoading: false, streaming: false });
               }
               throw vErr;
             }
@@ -2047,7 +2313,7 @@ Return JSON:
           this.taskManager.updateStep(task.id, qStep.id, 'failed', err.message);
           this.taskManager.updateTaskStatus(task.id, 'failed', { error: err.message });
           if (assistantMsg?.id) {
-            await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${err.message}` });
+            await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${err.message}`, isLoading: false, streaming: false });
           }
           throw err;
         }
@@ -2067,7 +2333,7 @@ Return JSON:
             this.taskManager.updateStep(task.id, qStep.id, 'failed', chatErr.message);
             this.taskManager.updateTaskStatus(task.id, 'failed', { error: chatErr.message });
             if (assistantMsg?.id) {
-              await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${chatErr.message}` });
+              await this.chatManager?.updateMessage(assistantMsg.id, { content: `⚠️ ${chatErr.message}`, isLoading: false, streaming: false });
             }
             throw chatErr;
           }
@@ -2149,6 +2415,10 @@ Return JSON:
       if (quizFinished) break;
     } // end for loop
 
+    if (this.taskManager.getTask(task.id)?.status === 'cancelled') {
+      return;
+    }
+
     // ─── FINAL TEST SUBMISSION & COMPLETION VERIFICATION ─────────────────
     try {
       const finalCtx = await pageCtxEngine.getMCQContext(tabId).catch(() => null);
@@ -2189,7 +2459,7 @@ Return JSON:
     ].filter(Boolean).join('\n');
 
     this.taskManager.updateTaskStatus(task.id, 'completed', { outputs: finalSummary });
-    if (assistantMsg?.id) await this.chatManager.updateMessage(assistantMsg.id, { content: finalSummary });
+    if (assistantMsg?.id) await this.chatManager.updateMessage(assistantMsg.id, { content: finalSummary, isLoading: false, streaming: false });
     this.auditLog?.updateEntry(auditEntryId, {
       execution_status: 'success',
       execution_result: finalSummary,

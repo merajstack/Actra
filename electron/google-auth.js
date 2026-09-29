@@ -25,9 +25,13 @@ function getOAuthCredentials() {
   return { clientId, clientSecret };
 }
 
+const StoreModule = require('electron-store');
+const Store = StoreModule.default || StoreModule;
+
 class GoogleAuth {
   constructor() {
     this.oauth2Client = null;
+    this.store = new Store({ name: 'google-auth-tokens', projectName: 'Actra' });
     this.scopes = [
       'https://www.googleapis.com/auth/userinfo.profile',
       'https://www.googleapis.com/auth/userinfo.email',
@@ -39,7 +43,6 @@ class GoogleAuth {
       'https://www.googleapis.com/auth/spreadsheets',
       'https://www.googleapis.com/auth/calendar'
     ];
-    // Fallback local store removed, we use Supabase now
   }
 
   async _initClient() {
@@ -55,38 +58,64 @@ class GoogleAuth {
       'http://127.0.0.1:3001/oauth2callback' // Local loopback URL
     );
 
-    // Get user from Supabase session
-    const { data: { user } } = await supabase.auth.getUser();
-
-    if (user) {
-      // Load saved tokens if any
-      const { data } = await supabase.from('google_auth_tokens').select('tokens').eq('user_id', user.id).single();
-      const savedTokens = data?.tokens;
-
-      if (savedTokens) {
-        // Verify scopes
-        const hasAllScopes = this.scopes.every(scope => 
-          savedTokens.scope && savedTokens.scope.includes(scope)
-        );
-        if (hasAllScopes) {
-          this.oauth2Client.setCredentials(savedTokens);
-        } else {
-          console.log('[GoogleAuth] Existing token lacks new scopes. Clearing token to force re-auth.');
-          await supabase.from('google_auth_tokens').delete().eq('user_id', user.id);
-        }
+    // 1. Immediately restore tokens from local disk store (ensures offline and fast startup auth)
+    const localTokens = this.store.get('tokens');
+    if (localTokens) {
+      const hasAllScopes = this.scopes.every(scope => 
+        localTokens.scope && localTokens.scope.includes(scope)
+      );
+      if (hasAllScopes) {
+        this.oauth2Client.setCredentials(localTokens);
+      } else {
+        console.log('[GoogleAuth] Local token lacks scopes. Clearing.');
+        this.store.delete('tokens');
       }
     }
 
-    // Automatically save new tokens when refreshed
-    this.oauth2Client.on('tokens', async (tokens) => {
+    // 2. Sync with Supabase session tokens if available
+    try {
       const { data: { user } } = await supabase.auth.getUser();
+
       if (user) {
+        // Load saved tokens if any from Supabase
         const { data } = await supabase.from('google_auth_tokens').select('tokens').eq('user_id', user.id).single();
-        const currentTokens = data?.tokens || {};
-        const newTokens = { ...currentTokens, ...tokens };
-        await supabase.from('google_auth_tokens').upsert({ user_id: user.id, tokens: newTokens });
-        this.oauth2Client.setCredentials(newTokens);
+        const savedTokens = data?.tokens;
+
+        if (savedTokens) {
+          // Verify scopes
+          const hasAllScopes = this.scopes.every(scope => 
+            savedTokens.scope && savedTokens.scope.includes(scope)
+          );
+          if (hasAllScopes) {
+            this.oauth2Client.setCredentials(savedTokens);
+            this.store.set('tokens', savedTokens);
+          } else {
+            console.log('[GoogleAuth] Existing token lacks new scopes. Clearing token to force re-auth.');
+            await supabase.from('google_auth_tokens').delete().eq('user_id', user.id);
+            this.store.delete('tokens');
+          }
+        } else if (localTokens && this.oauth2Client.credentials) {
+          // Backfill Supabase from local disk store
+          await supabase.from('google_auth_tokens').upsert({ user_id: user.id, tokens: localTokens });
+        }
       }
+    } catch (e) {
+      console.warn('[GoogleAuth] Supabase token check failed, relying on local store:', e.message);
+    }
+
+    // Automatically save new tokens to disk and Supabase when refreshed
+    this.oauth2Client.on('tokens', async (tokens) => {
+      const currentTokens = this.store.get('tokens') || {};
+      const newTokens = { ...currentTokens, ...tokens };
+      this.store.set('tokens', newTokens);
+      this.oauth2Client.setCredentials(newTokens);
+
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (user) {
+          await supabase.from('google_auth_tokens').upsert({ user_id: user.id, tokens: newTokens });
+        }
+      } catch (_) {}
     });
   }
 
@@ -201,22 +230,28 @@ class GoogleAuth {
               `);
               
               const { tokens } = await client.getToken(code);
-              
+              const currentTokens = this.store.get('tokens') || {};
+              const mergedTokens = { ...currentTokens, ...tokens };
+              this.store.set('tokens', mergedTokens);
+              client.setCredentials(mergedTokens);
+
               if (tokens.id_token) {
-                const { data, error } = await supabase.auth.signInWithIdToken({
-                  provider: 'google',
-                  token: tokens.id_token
-                });
-                if (error) {
-                  console.error('Supabase auth error:', error);
-                } else if (data.user) {
-                   await supabase.from('google_auth_tokens').upsert({ user_id: data.user.id, tokens });
+                try {
+                  const { data, error } = await supabase.auth.signInWithIdToken({
+                    provider: 'google',
+                    token: tokens.id_token
+                  });
+                  if (error) {
+                    console.error('Supabase auth error:', error);
+                  } else if (data.user) {
+                    await supabase.from('google_auth_tokens').upsert({ user_id: data.user.id, tokens: mergedTokens });
+                  }
+                } catch (supaErr) {
+                  console.warn('[GoogleAuth] Supabase signIn error:', supaErr.message);
                 }
               } else {
-                 console.warn("No id_token received from Google, cannot sign into Supabase.");
+                console.warn("No id_token received from Google, cannot sign into Supabase.");
               }
-              
-              client.setCredentials(tokens);
               
               server.close();
               resolve({ success: true, id_token: tokens.id_token });
@@ -244,13 +279,18 @@ class GoogleAuth {
   }
 
   async signOut() {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (user) {
-      await supabase.from('google_auth_tokens').delete().eq('user_id', user.id);
-    }
-    await supabase.auth.signOut();
+    this.store.delete('tokens');
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        await supabase.from('google_auth_tokens').delete().eq('user_id', user.id);
+      }
+    } catch (_) {}
+    try {
+      await supabase.auth.signOut();
+    } catch (_) {}
     if (this.oauth2Client) {
-      this.oauth2Client.revokeCredentials();
+      try { this.oauth2Client.revokeCredentials(); } catch (_) {}
       this.oauth2Client.credentials = {};
     }
   }

@@ -172,6 +172,8 @@ export interface ChatMessage {
   taskId?: string;        // If the message is tied to an active task (for rendering task progress)
   approvalId?: string;    // If the message contains an approval request
   toolName?: string;
+  isLoading?: boolean;
+  streaming?: boolean;
 }
 
 export interface ChatSession {

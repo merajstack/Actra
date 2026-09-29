@@ -203,6 +203,7 @@ function createWindow() {
     pageContextEngine,
     groundingRouter,
     planner: plannerEngine,
+    approvalEngine,
   });
 
   // Tie TaskManager updates to React UI
@@ -265,54 +266,164 @@ app.whenReady().then(() => {
     });
   });
 
+  const PERSISTENT_PARTITION = TabManager.PERSISTENT_PARTITION || 'persist:actra';
+  const inFlightCookieKeys = new Set();
+
+  /**
+   * Configure cookie persistence:
+   * Chromium drops session cookies (cookies without expiry) when the browser quits.
+   * This listener re-sets any non-persistent session cookie with expirationDate = now + 30 days.
+   * Incognito partitions (non-persistent) are skipped.
+   */
+  function setupCookiePersistence(ses) {
+    if (!ses || !ses.cookies || (typeof ses.isPersistent === 'function' && !ses.isPersistent())) {
+      return;
+    }
+
+    ses.cookies.on('changed', async (event, cookie, cause, removed) => {
+      // Only process cookies that exist and are session cookies (no expiry)
+      if (removed || !cookie || !cookie.session) return;
+
+      const cookieKey = `${cookie.name}@${cookie.domain || ''}${cookie.path || ''}`;
+      if (inFlightCookieKeys.has(cookieKey)) return;
+      inFlightCookieKeys.add(cookieKey);
+
+      try {
+        const protocol = cookie.secure ? 'https://' : 'http://';
+        const cleanDomain = cookie.domain?.startsWith('.') ? cookie.domain.slice(1) : (cookie.domain || 'localhost');
+        const cookiePath = cookie.path || '/';
+        const url = `${protocol}${cleanDomain}${cookiePath}`;
+
+        // 30 days from now in seconds
+        const expirationDate = Math.floor(Date.now() / 1000) + (30 * 24 * 60 * 60);
+
+        const details = {
+          url,
+          name: cookie.name,
+          value: cookie.value,
+          path: cookiePath,
+          secure: !!cookie.secure,
+          httpOnly: !!cookie.httpOnly,
+          expirationDate,
+        };
+
+        // In Chromium, hostOnly cookies must NOT have domain specified explicitly
+        if (!cookie.hostOnly && cookie.domain) {
+          details.domain = cookie.domain;
+        }
+
+        if (cookie.sameSite && cookie.sameSite !== 'unspecified') {
+          details.sameSite = cookie.sameSite;
+        }
+
+        await ses.cookies.set(details);
+      } catch (err) {
+        // Silently ignore cookies with unsupported schemes or invalid structures
+      } finally {
+        inFlightCookieKeys.delete(cookieKey);
+      }
+    });
+  }
+
+  function configureWebSession(ses, isPersistent = true) {
+    if (!ses) return;
+
+    // Strip Cross-Origin headers so sites like YouTube load correctly in BrowserView
+    ses.webRequest.onHeadersReceived((details, callback) => {
+      const headers = details.responseHeaders || {};
+      const blocked = [
+        'cross-origin-opener-policy',
+        'cross-origin-embedder-policy',
+        'cross-origin-resource-policy',
+      ];
+      for (const key of Object.keys(headers)) {
+        if (blocked.includes(key.toLowerCase())) delete headers[key];
+      }
+      callback({ responseHeaders: headers });
+    });
+
+    // Automatically grant permissions for microphone so renderer doesn't get silent stream
+    ses.setPermissionRequestHandler((webContents, permission, callback) => {
+      if (permission === 'media') {
+        callback(true);
+      } else {
+        callback(false);
+      }
+    });
+
+    ses.setPermissionCheckHandler((webContents, permission) => {
+      if (permission === 'media') {
+        return true;
+      }
+      return false;
+    });
+
+    if (isPersistent) {
+      setupCookiePersistence(ses);
+    }
+  }
+
+  const actraSession = session.fromPartition(PERSISTENT_PARTITION);
+  configureWebSession(session.defaultSession, true);
+  configureWebSession(actraSession, true);
+
   createWindow();
-
-  // Strip Cross-Origin headers so sites like YouTube load correctly in BrowserView
-  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
-    const headers = details.responseHeaders || {};
-    const blocked = [
-      'cross-origin-opener-policy',
-      'cross-origin-embedder-policy',
-      'cross-origin-resource-policy',
-    ];
-    for (const key of Object.keys(headers)) {
-      if (blocked.includes(key.toLowerCase())) delete headers[key];
-    }
-    callback({ responseHeaders: headers });
-  });
-
-  // Automatically grant permissions for microphone so renderer doesn't get silent stream
-  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    if (permission === 'media') {
-      callback(true);
-    } else {
-      callback(false);
-    }
-  });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
-
-  // Automatically approve media permissions for VoiceCommandBar
-  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    if (permission === 'media') {
-      callback(true);
-    } else {
-      callback(false);
-    }
-  });
-
-  session.defaultSession.setPermissionCheckHandler((webContents, permission) => {
-    if (permission === 'media') {
-      return true;
-    }
-    return false;
-  });
 });
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
+async function flushAllCookies() {
+  const PERSISTENT_PARTITION = TabManager.PERSISTENT_PARTITION || 'persist:actra';
+  const sessions = [
+    session.defaultSession,
+    session.fromPartition(PERSISTENT_PARTITION),
+  ];
+
+  await Promise.all(
+    sessions.map(async (ses) => {
+      try {
+        if (ses && ses.cookies && typeof ses.cookies.flushStore === 'function') {
+          await ses.cookies.flushStore();
+        }
+      } catch (err) {
+        console.warn('[Session] Failed to flush cookies store:', err);
+      }
+    })
+  );
+}
+
+let isFlushingOnQuit = false;
+let hasFlushedOnQuit = false;
+
+app.on('before-quit', async (event) => {
+  if (!hasFlushedOnQuit) {
+    event.preventDefault();
+    if (!isFlushingOnQuit) {
+      isFlushingOnQuit = true;
+      try {
+        await flushAllCookies();
+      } catch (err) {
+        console.error('[Session] Error during before-quit cookie flush:', err);
+      } finally {
+        hasFlushedOnQuit = true;
+        isFlushingOnQuit = false;
+        app.quit();
+      }
+    }
+  }
+});
+
+app.on('window-all-closed', async () => {
+  try {
+    await flushAllCookies();
+  } catch (err) {
+    console.error('[Session] Error during window-all-closed cookie flush:', err);
+  }
+  if (process.platform !== 'darwin') {
+    app.quit();
+  }
 });
 
 // ─── Tab IPC Handlers ──────────────────────────────────────────────────────
@@ -422,13 +533,42 @@ ipcMain.handle('ai:clear-chat', async () => {
   await chatManager.clearActiveSession();
   return await chatManager.getHistory();
 });
-ipcMain.handle('ai:cancel-task', (_, taskId) => {
+ipcMain.handle('ai:cancel-task', async (_, taskId) => {
   taskManager.updateTaskStatus(taskId, 'cancelled');
+  try {
+    const session = await chatManager.getActiveSession();
+    const msg = session?.messages?.find(m => m.taskId === taskId);
+    if (msg && (msg.isLoading || msg.streaming || !msg.content)) {
+      await chatManager.updateMessage(msg.id, {
+        content: msg.content || 'Task cancelled by user.',
+        isLoading: false,
+        streaming: false,
+      });
+    }
+  } catch (err) {
+    console.warn('[main] Error updating message on cancel-task:', err.message);
+  }
   return true;
 });
-ipcMain.handle('ai:cancel-all-tasks', () => {
+ipcMain.handle('ai:cancel-all-tasks', async () => {
   const result = taskManager.cancelAllActiveTasks ? taskManager.cancelAllActiveTasks() : { success: true, cancelled: [] };
   if (approvalEngine?.rejectAll) approvalEngine.rejectAll('Cancelled by user');
+  try {
+    const session = await chatManager.getActiveSession();
+    if (session?.messages) {
+      for (const msg of session.messages) {
+        if (msg.taskId && (msg.isLoading || msg.streaming || !msg.content)) {
+          await chatManager.updateMessage(msg.id, {
+            content: msg.content || 'Task cancelled by user.',
+            isLoading: false,
+            streaming: false,
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[main] Error updating messages on cancel-all-tasks:', err.message);
+  }
   return result;
 });
 
@@ -535,7 +675,9 @@ function isLikelyBrowserAction(command) {
   const mcqPattern = /\b(solve (the |all |these |this )?(mcq|mcqs|quiz|questions?|exam|test)|answer (the |all |these |this )?(mcq|mcqs|questions?|options?)|select (the |all )?(options?|answers?)|auto(matically)? (solve|answer|select)|do (the |this )?(quiz|test|exam|questions?)|click (options?|answers?) (and|then) (next|submit)|attempt (the |this )?(quiz|test|exam))\b/i;
   const tabMcqPattern = /\b(mcq|mcqs|quiz|questions?)\b.*\b(tab (one|1|two|2|three|3|four|4|five|5))/i;
   const oneByOneMcqPattern = /\bone by one\b/i.test(t) && /\b(mcq|mcqs|quiz|question|answer|option|tab)/i.test(t);
+  const constraintPattern = /\b(under\s+[\$₹£€]?\d+|delivery\s+(under|in|within)|add\s+(?:it\s+)?to\s+cart|cart)\b/i;
   return navPattern.test(t) || interactPattern.test(t) || sitePattern.test(t) || urlPattern.test(t)
+    || constraintPattern.test(t)
     || mcqPattern.test(t) || tabMcqPattern.test(t) || oneByOneMcqPattern
     || /\b(solve|answer)\b.*\b(one by one|one-by-one)\b/i.test(t)
     || /\b(solve|answer)\b.*\b(mcq|mcqs|quiz)\b/i.test(t);
@@ -559,6 +701,7 @@ async function executeAICommand(command, activeTabId, mcqModel) {
 
   // Return immediately so CommandBar closes; all work is async
   (async () => {
+    let executionError = null;
     try {
       // ── FAST PATH 1: Pure chat/Q&A — skip planning entirely ───────────
       if (isLikelyConversational(command) && !isLikelyBrowserAction(command)) {
@@ -576,11 +719,11 @@ async function executeAICommand(command, activeTabId, mcqModel) {
           });
           const out = text || 'How can I help?';
           taskManager.updateTaskStatus(task.id, 'completed', { outputs: out });
-          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: out });
+          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: out, isLoading: false, streaming: false });
           auditLog.updateEntry(auditEntryId, { execution_status: 'success', execution_result: 'chat' });
         } catch (fastErr) {
           taskManager.updateTaskStatus(task.id, 'failed', { error: fastErr.message });
-          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: `Error: ${fastErr.message}` });
+          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: `Error: ${fastErr.message}`, isLoading: false, streaming: false });
           auditLog.updateEntry(auditEntryId, { execution_status: 'failed', error: fastErr.message });
         }
         return;
@@ -595,7 +738,7 @@ async function executeAICommand(command, activeTabId, mcqModel) {
         } catch (browserErr) {
           console.error('[BrowserAgent] Fast-path execution failed:', browserErr.message);
           taskManager.updateTaskStatus(task.id, 'failed', { error: browserErr.message });
-          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: `❌ ${browserErr.message}` });
+          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: `❌ ${browserErr.message}`, isLoading: false, streaming: false });
           auditLog.updateEntry(auditEntryId, { execution_status: 'failed', error: browserErr.message });
         }
         return;
@@ -680,14 +823,14 @@ https://example.com
 
           taskManager.updateStep(task.id, analyzeStep.id, 'completed');
           taskManager.updateTaskStatus(task.id, 'completed', { outputs: text });
-          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: text });
+          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: text, isLoading: false, streaming: false });
           auditLog.updateEntry(auditEntryId, { execution_status: 'success', execution_result: 'workspace_success' });
 
         } catch (wsErr) {
           console.error('[Workspace] Fast-path execution failed:', wsErr.message);
           taskManager.updateStep(task.id, workspaceStep.id, 'failed', wsErr.message);
           taskManager.updateTaskStatus(task.id, 'failed', { error: wsErr.message });
-          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: `❌ ${wsErr.message}` });
+          if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: `❌ ${wsErr.message}`, isLoading: false, streaming: false });
           auditLog.updateEntry(auditEntryId, { execution_status: 'failed', error: wsErr.message });
         }
         return;
@@ -885,7 +1028,7 @@ https://example.com
           taskManager.updateTaskStatus(task.id, 'failed', { error: error.message });
           if (assistantMsg?.id) {
             const prefix = (error?.isModelQuotaError || error?.code?.startsWith('QUOTA_')) ? '⚠️ ' : 'Error: ';
-            await chatManager.updateMessage(assistantMsg.id, { content: `${prefix}${error.message}` });
+            await chatManager.updateMessage(assistantMsg.id, { content: `${prefix}${error.message}`, isLoading: false, streaming: false });
           }
           auditLog.updateEntry(auditEntryId, { execution_status: 'failed', error: error.message });
         }
@@ -1218,19 +1361,65 @@ https://example.com
       auditLog.updateEntry(auditEntryId, { execution_status: 'success', execution_result: summary });
       const responseText = finalResponseText || 'Task completed, but Actra returned an empty response.';
       taskManager.updateTaskStatus(task.id, 'completed', { outputs: responseText });
-      if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: responseText });
+      if (assistantMsg?.id) await chatManager.updateMessage(assistantMsg.id, { content: responseText, isLoading: false, streaming: false });
 
     } catch (err) {
+      executionError = err;
       console.error('[AI] Workflow failed:', err.message);
-      taskManager.updateTaskStatus(task.id, 'failed', { error: err.message });
+      const isRejection = err.message?.includes('Rejected by user');
+      const isCancel = err.message?.includes('Cancelled by user');
+      const terminalStatus = isRejection ? 'rejected' : (isCancel ? 'cancelled' : 'failed');
+      taskManager.updateTaskStatus(task.id, terminalStatus, { error: err.message });
       if (assistantMsg?.id) {
-        const prefix = (err?.isModelQuotaError || err?.code?.startsWith('QUOTA_')) ? '⚠️ ' : 'Error: ';
-        await chatManager.updateMessage(assistantMsg.id, { content: `${prefix}${err.message}` });
+        const prefix = (err?.isModelQuotaError || err?.code?.startsWith('QUOTA_')) ? '⚠️ ' : (isRejection || isCancel ? '' : 'Error: ');
+        await chatManager.updateMessage(assistantMsg.id, { content: `${prefix}${err.message}`, isLoading: false, streaming: false });
       }
       auditLog.updateEntry(auditEntryId, {
-        execution_status: 'failed',
+        execution_status: terminalStatus,
         error: err.message,
       });
+    } finally {
+      // 1. Ensure task is in a terminal status
+      const currentTask = taskManager.getTask(task?.id);
+      const isTerminal = currentTask && ['completed', 'failed', 'cancelled', 'rejected'].includes(currentTask.status);
+      if (!isTerminal && task?.id) {
+        if (executionError) {
+          taskManager.updateTaskStatus(task.id, 'failed', { error: executionError.message });
+        } else {
+          const status = currentTask?.status === 'cancelled' ? 'cancelled' : 'completed';
+          taskManager.updateTaskStatus(task.id, status);
+        }
+      }
+
+      // 2. Ensure assistant message has isLoading: false, streaming: false with final text
+      if (assistantMsg?.id) {
+        try {
+          const session = await chatManager.getActiveSession();
+          const msg = session?.messages?.find(m => m.id === assistantMsg.id);
+          if (msg && (msg.isLoading || msg.streaming || !msg.content)) {
+            const finalTask = taskManager.getTask(task?.id);
+            let finalContent = msg.content;
+            if (!finalContent) {
+              if (finalTask?.status === 'cancelled') {
+                finalContent = 'Task was cancelled.';
+              } else if (finalTask?.status === 'failed') {
+                finalContent = finalTask.error ? `❌ ${finalTask.error}` : 'Task failed.';
+              } else if (executionError) {
+                finalContent = `❌ ${executionError.message}`;
+              } else {
+                finalContent = typeof finalTask?.outputs === 'string' ? finalTask.outputs : 'Task completed.';
+              }
+            }
+            await chatManager.updateMessage(assistantMsg.id, {
+              content: finalContent,
+              isLoading: false,
+              streaming: false,
+            });
+          }
+        } catch (chatErr) {
+          console.warn('[main] Failed to update chat message in finally:', chatErr.message);
+        }
+      }
     }
   })();
 

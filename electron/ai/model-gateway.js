@@ -263,6 +263,19 @@ class ModelGateway {
 
     if (!accountId || !apiToken) {
       try {
+        const fs = require('fs');
+        const os = require('os');
+        const fallbackConfig = path.join(os.homedir(), 'Library/Application Support/Actra/config.json');
+        if (fs.existsSync(fallbackConfig)) {
+          const cfg = JSON.parse(fs.readFileSync(fallbackConfig, 'utf8'));
+          if (cfg.cloudflareAccountId && !accountId) accountId = cfg.cloudflareAccountId.trim();
+          if (cfg.cloudflareApiKey && !apiToken) apiToken = cfg.cloudflareApiKey.trim();
+        }
+      } catch (_) {}
+    }
+
+    if (!accountId || !apiToken) {
+      try {
         const { data: accData } = await supabase.from('settings').select('value').eq('key', 'cloudflareAccountId').single();
         const { data: keyData } = await supabase.from('settings').select('value').eq('key', 'cloudflareApiKey').single();
         if (accData?.value && typeof accData.value === 'string' && accData.value.trim().length > 5) accountId = accData.value.trim();
@@ -279,6 +292,17 @@ class ModelGateway {
       const localKey = new Store({ name: 'config', projectName: 'Actra' }).get('groqKey');
       if (localKey && typeof localKey === 'string' && localKey.trim().length > 5) return localKey.trim();
     } catch (e) {}
+    try {
+      const fs = require('fs');
+      const os = require('os');
+      const fallbackConfig = path.join(os.homedir(), 'Library/Application Support/Actra/config.json');
+      if (fs.existsSync(fallbackConfig)) {
+        const cfg = JSON.parse(fs.readFileSync(fallbackConfig, 'utf8'));
+        if (cfg.groqKey && typeof cfg.groqKey === 'string' && cfg.groqKey.trim().length > 5) {
+          return cfg.groqKey.trim();
+        }
+      }
+    } catch (_) {}
     try {
       const { data } = await supabase.from('settings').select('value').eq('key', 'groqKey').single();
       if (data?.value && typeof data.value === 'string' && data.value.trim().length > 5) return data.value.trim();

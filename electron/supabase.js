@@ -1,19 +1,16 @@
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
-// Lazily load electron-store
-let Store;
-async function getStore() {
-  if (!Store) {
-    const mod = await import('electron-store');
-    Store = mod.default || mod;
-  }
-  return Store;
-}
+// Synchronously initialize electron-store for disk-persisted auth & offline storage
+const StoreModule = require('electron-store');
+const Store = StoreModule.default || StoreModule;
 
-let authStore, offlineStore, syncQueueStore;
-async function getAuthStore() { if (!authStore) { const S = await getStore(); authStore = new S({ name: 'actra-auth-store', projectName: 'Actra' }); } return authStore; }
-async function getOfflineStore() { if (!offlineStore) { const S = await getStore(); offlineStore = new S({ name: 'actra-offline-cache', projectName: 'Actra' }); } return offlineStore; }
-async function getSyncQueueStore() { if (!syncQueueStore) { const S = await getStore(); syncQueueStore = new S({ name: 'actra-sync-queue', projectName: 'Actra' }); } return syncQueueStore; }
+const authStore = new Store({ name: 'actra-auth-store', projectName: 'Actra', accessPropertiesByDotNotation: false });
+const offlineStore = new Store({ name: 'actra-offline-cache', projectName: 'Actra', accessPropertiesByDotNotation: false });
+const syncQueueStore = new Store({ name: 'actra-sync-queue', projectName: 'Actra', accessPropertiesByDotNotation: false });
+
+function getAuthStore() { return authStore; }
+function getOfflineStore() { return offlineStore; }
+function getSyncQueueStore() { return syncQueueStore; }
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
@@ -61,11 +58,30 @@ if (!supabaseUrl || !supabaseAnonKey) {
   console.warn("Supabase URL or Anon Key not found in environment variables.");
 }
 
-// Auth storage using electron-store
+// Auth storage using electron-store (persisted to disk at actra-auth-store.json)
 const customAuthStorage = {
-  getItem: async (key) => { const s = await getAuthStore(); return s.get(key) || null; },
-  setItem: async (key, value) => { const s = await getAuthStore(); return s.set(key, value); },
-  removeItem: async (key) => { const s = await getAuthStore(); return s.delete(key); }
+  getItem: (key) => {
+    try {
+      const val = authStore.get(key);
+      return val !== undefined ? val : null;
+    } catch (e) {
+      return null;
+    }
+  },
+  setItem: (key, value) => {
+    try {
+      authStore.set(key, value);
+    } catch (e) {
+      console.warn('[SupabaseAuth] Failed to set auth token to store:', e);
+    }
+  },
+  removeItem: (key) => {
+    try {
+      authStore.delete(key);
+    } catch (e) {
+      console.warn('[SupabaseAuth] Failed to remove auth token from store:', e);
+    }
+  }
 };
 
 const supabase = supabaseUrl && supabaseAnonKey

@@ -5,6 +5,8 @@
  */
 const { BrowserView, Menu, clipboard } = require('electron');
 
+const PERSISTENT_PARTITION = 'persist:actra';
+
 class TabManager {
   constructor(mainWindow) {
     this.mainWindow = mainWindow;
@@ -42,7 +44,6 @@ class TabManager {
     this.mainWindow.on('leave-full-screen', onFullscreenChange);
   }
 
-
   /**
    * Create a new tab with its own independent BrowserView.
    * Each BrowserView gets its own webContents (Chromium renderer process).
@@ -50,15 +51,22 @@ class TabManager {
   createTab(url = 'https://www.google.com', isIncognito = false, customTabId = null) {
     const tabId = customTabId || `view-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
+    // Normal tabs MUST use a persistent partition ("persist:...") to keep logins and cookies.
+    // Incognito tabs use an in-memory partition (no "persist:" prefix) so nothing is written to disk.
+    const partition = isIncognito ? `incognito-${Date.now()}` : PERSISTENT_PARTITION;
+
     const view = new BrowserView({
       webPreferences: {
         nodeIntegration: false,
         contextIsolation: true,
-        partition: isIncognito ? `persist:incognito-${Date.now()}` : 'default',
+        partition,
         sandbox: true,
         safeDialogs: true,
       }
     });
+
+    view.isIncognito = isIncognito;
+    view.tabId = tabId;
 
     this.tabs.set(tabId, view);
     if (!this.tabOrder.includes(tabId)) {
@@ -267,7 +275,7 @@ class TabManager {
     const view = this.tabs.get(tabId);
     if (!view) return null;
     const url = view.webContents.getURL() || 'chrome://newtab';
-    const isIncognito = view.webPreferences?.partition?.startsWith('persist:incognito') || false;
+    const isIncognito = view.isIncognito || false;
     const newTabId = this.createTab(url, isIncognito);
     this._sendToRenderer('new-tab-created', { tabId: newTabId, url, isIncognito });
     return newTabId;
@@ -569,5 +577,7 @@ class TabManager {
     });
   }
 }
+
+TabManager.PERSISTENT_PARTITION = PERSISTENT_PARTITION;
 
 module.exports = TabManager;

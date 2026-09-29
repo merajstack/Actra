@@ -152,25 +152,94 @@ const ApprovalCard: React.FC<any> = ({ approval, onApprove, onReject, onEdit, on
 };
 
 // ─── Task Progress ────────────────────────────────────────────────────────
-const TaskProgress: React.FC<{ taskId: string, tasks: AITask[], fallbackContent?: string }> = ({ taskId, tasks, fallbackContent }) => {
+const TaskProgress: React.FC<{
+  taskId: string;
+  tasks: AITask[];
+  fallbackContent?: string;
+  messageTimestamp?: number;
+}> = ({ taskId, tasks, fallbackContent, messageTimestamp }) => {
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 2000);
+    return () => clearInterval(timer);
+  }, []);
+
   const task = tasks.find(t => t.id === taskId);
-  if (!task) return <div className="text-[13px] text-black font-medium">Starting request...</div>;
+  const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'rejected']);
 
-  const isFailed = task.status === 'failed' || task.status === 'rejected';
-  const isActive = !['completed', 'failed', 'cancelled', 'rejected'].includes(task.status);
-
-  if (task.status === 'completed') {
-    return <div className="text-[13px] text-black leading-relaxed whitespace-pre-wrap font-normal">{task.outputs || fallbackContent || 'Task completed, but Actra returned an empty response.'}</div>;
+  if (!task) {
+    if (fallbackContent) {
+      return (
+        <div className="text-[13px] text-black leading-relaxed whitespace-pre-wrap font-normal">
+          {fallbackContent}
+        </div>
+      );
+    }
+    const isOld = messageTimestamp && (now - messageTimestamp > 60000);
+    if (isOld) {
+      return (
+        <div className="text-[13px] text-zinc-500 font-medium">
+          Request timed out (no activity for 60s).
+        </div>
+      );
+    }
+    return (
+      <div className="flex items-center space-x-2 text-[13px] text-black font-medium">
+        <Loader2 className="w-4 h-4 text-orange-500 animate-spin" />
+        <span>Starting request...</span>
+      </div>
+    );
   }
 
+  const isTerminal = TERMINAL_STATUSES.has(task.status);
+  const lastActiveTime = task.updatedAt || task.createdAt || now;
+  const isTimedOut = !isTerminal && (now - lastActiveTime > 60000);
+  const isActive = !isTerminal && !isTimedOut;
+
+  if (task.status === 'completed') {
+    return (
+      <div className="text-[13px] text-black leading-relaxed whitespace-pre-wrap font-normal">
+        {task.outputs || fallbackContent || 'Task completed, but Actra returned an empty response.'}
+      </div>
+    );
+  }
+
+  const isFailed = task.status === 'failed' || task.status === 'rejected';
   if (isFailed && task.error) {
-    return <div className="text-[13px] text-red-700 bg-red-50 p-3 rounded-lg border border-red-200 font-medium">{task.error}</div>;
+    return (
+      <div className="text-[13px] text-red-700 bg-red-50 p-3 rounded-lg border border-red-200 font-medium">
+        {task.error}
+      </div>
+    );
   }
 
   if (isFailed || task.status === 'cancelled') {
-    return <div className="text-[13px] text-red-700 bg-red-50 p-3 rounded-lg border border-red-200 font-medium">
-      {task.status === 'cancelled' ? 'Request cancelled.' : 'Actra could not complete this request.'}
-    </div>;
+    return (
+      <div className="text-[13px] text-red-700 bg-red-50 p-3 rounded-lg border border-red-200 font-medium">
+        {task.status === 'cancelled' ? 'Request cancelled.' : 'Actra could not complete this request.'}
+      </div>
+    );
+  }
+
+  if (isTimedOut) {
+    return (
+      <div className="space-y-2 w-full text-black">
+        <div className="text-[13px] text-zinc-600 bg-zinc-100 p-2.5 rounded-lg border border-zinc-200 font-medium">
+          ⏱️ Request timed out (no response for 60s).
+        </div>
+        {task.steps.length > 0 && (
+          <div className="space-y-1 text-[12px] text-zinc-600">
+            {task.steps.map(step => (
+              <div key={step.id} className="flex items-center space-x-2">
+                <span className="font-bold">{step.status === 'completed' ? '✓' : step.status === 'running' ? '⏹' : step.status === 'failed' ? '❌' : '·'}</span>
+                <span>{step.description}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
   }
 
   return (
@@ -241,6 +310,12 @@ export const AIChat: React.FC<AIChatProps> = ({
   const [input, setInput] = useState('');
   const [tasks, setTasks] = useState<AITask[]>([]);
   const [localApprovals, setLocalApprovals] = useState<AIApprovalRequest[]>([]);
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 2000);
+    return () => clearInterval(timer);
+  }, []);
 
   const approvals = propApprovals !== undefined ? propApprovals : localApprovals;
   const setApprovals = propSetApprovals !== undefined ? propSetApprovals : setLocalApprovals;
@@ -523,9 +598,29 @@ export const AIChat: React.FC<AIChatProps> = ({
                 ) : (
                   <div className="space-y-3 text-black">
                     {msg.taskId ? (
-                      <TaskProgress taskId={msg.taskId} tasks={tasks} fallbackContent={msg.content} />
+                      <TaskProgress
+                        taskId={msg.taskId}
+                        tasks={tasks}
+                        fallbackContent={msg.content}
+                        messageTimestamp={msg.timestamp}
+                      />
                     ) : (
-                      <div className="text-[13px] text-black leading-relaxed whitespace-pre-wrap font-normal">{msg.content}</div>
+                      <div className="space-y-1">
+                        {msg.content ? (
+                          <div className="text-[13px] text-black leading-relaxed whitespace-pre-wrap font-normal">{msg.content}</div>
+                        ) : (
+                          (msg.isLoading || msg.streaming) && (now - msg.timestamp <= 60000) ? (
+                            <div className="flex items-center space-x-2 text-[13px] text-zinc-500 font-medium">
+                              <Loader2 className="w-4 h-4 text-orange-500 animate-spin" />
+                              <span>Thinking...</span>
+                            </div>
+                          ) : (
+                            <div className="text-[13px] text-zinc-500 font-medium">
+                              {now - msg.timestamp > 60000 ? 'Request timed out (no response for 60s).' : ''}
+                            </div>
+                          )
+                        )}
+                      </div>
                     )}
 
                     {/* Render Approvals Inline */}

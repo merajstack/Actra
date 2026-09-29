@@ -67,21 +67,45 @@ export default function App() {
   const [activeTabId, setActiveTabId] = useState('tab-1');
   const [browserMode, setBrowserMode] = useState<BrowserMode>('browser');
 
-  const [isOnboardingComplete, setIsOnboardingComplete] = useState(false);
+  const [isOnboardingComplete, setIsOnboardingComplete] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('actra_onboarding_complete') === 'true';
+    } catch {
+      return false;
+    }
+  });
   const [isCheckingOnboarding, setIsCheckingOnboarding] = useState(true);
   const [isVisualAnalyzing, setIsVisualAnalyzing] = useState(false);
 
-  const [userProfile, setUserProfile] = useState<{ displayName: string; avatarUrl?: string } | null>(null);
+  const [userProfile, setUserProfile] = useState<{ displayName: string; avatarUrl?: string } | null>(() => {
+    try {
+      const saved = localStorage.getItem('actra_user_profile');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
 
   useEffect(() => {
     const fetchSettings = async () => {
-      const { data } = await supabase.from('settings').select('key, value').in('key', ['onboardingComplete', 'userProfile']);
-      if (data) {
-        const settings = data.reduce((acc, curr) => ({ ...acc, [curr.key]: curr.value }), {} as any);
-        if (settings.onboardingComplete === 'true') setIsOnboardingComplete(true);
-        if (settings.userProfile) setUserProfile(settings.userProfile);
+      try {
+        const { data } = await supabase.from('settings').select('key, value').in('key', ['onboardingComplete', 'userProfile']);
+        if (data && data.length > 0) {
+          const settings = data.reduce((acc, curr) => ({ ...acc, [curr.key]: curr.value }), {} as any);
+          if (settings.onboardingComplete === 'true') {
+            setIsOnboardingComplete(true);
+            try { localStorage.setItem('actra_onboarding_complete', 'true'); } catch (_) {}
+          }
+          if (settings.userProfile) {
+            setUserProfile(settings.userProfile);
+            try { localStorage.setItem('actra_user_profile', JSON.stringify(settings.userProfile)); } catch (_) {}
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to load settings from Supabase:', err);
+      } finally {
+        setIsCheckingOnboarding(false);
       }
-      setIsCheckingOnboarding(false);
     };
     fetchSettings();
   }, []);
@@ -639,6 +663,10 @@ export default function App() {
   };
 
   const handleLogout = async () => {
+    try {
+      localStorage.removeItem('actra_onboarding_complete');
+      localStorage.removeItem('actra_user_profile');
+    } catch (_) {}
     await supabase.auth.signOut();
     await supabase.from('settings').delete().in('key', ['onboardingComplete', 'userProfile']);
     if (isElectron && typeof (window as any).electronAPI.clearData === 'function') {
@@ -824,6 +852,10 @@ export default function App() {
               isIncognito={activeTab.isIncognito || false} 
               userProfile={userProfile}
               onLogout={async () => {
+                try {
+                  localStorage.removeItem('actra_onboarding_complete');
+                  localStorage.removeItem('actra_user_profile');
+                } catch (_) {}
                 setIsOnboardingComplete(false);
                 setUserProfile(null);
                 await supabase.from('settings').delete().in('key', ['onboardingComplete', 'userProfile', 'cloudflareAccountId', 'cloudflareApiKey', 'groqKey']);
@@ -911,9 +943,11 @@ export default function App() {
                 avatarUrl: prev?.avatarUrl
               };
               settingsToSave.push({ key: 'userProfile', value: finalProfile as any });
+              try { localStorage.setItem('actra_user_profile', JSON.stringify(finalProfile)); } catch (_) {}
               return finalProfile;
             });
             
+            try { localStorage.setItem('actra_onboarding_complete', 'true'); } catch (_) {}
             await supabase.from('settings').upsert(settingsToSave);
 
             setIsOnboardingComplete(true);
